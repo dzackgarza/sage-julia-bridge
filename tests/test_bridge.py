@@ -740,6 +740,17 @@ class OscarCoercionTest(unittest.TestCase):
         self.assertEqual(result, m)
         self.assertIs(result.base_ring(), ZZ)
 
+    def test_toplevel_parent_shares_identity_with_elements(self) -> None:
+        # A parent sent as a top-level value must be THE parent of elements
+        # sent in later payloads (PR #4 review): the top-level doc carries
+        # the same deterministic UUID that element payloads use in _refs.
+        from sage.all import PolynomialRing
+
+        R = PolynomialRing(QQ, "s")
+        self.bridge.set("Rring", R)
+        self.bridge.set("pelem", R.gen() + 1)
+        self.assertEqual(self.bridge.eval("parent(pelem) === Rring"), "true")
+
     def test_parent_objects_decode(self) -> None:
         from sage.all import GF
 
