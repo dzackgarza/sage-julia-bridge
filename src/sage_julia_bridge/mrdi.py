@@ -458,12 +458,17 @@ def encode_mrdi(value: object) -> dict | None:
         params = _encode_parent(value, refs)
         if params is None:
             return None
-        # Lift the parent's own spec to the top level of the document.
-        spec = refs.pop(params) if isinstance(params, str) else params
-        doc = {
-            "_ns": {"Oscar": [OSCAR_NS_URL, OSCAR_NS_VERSION]},
-            "_type": spec["_type"],
-        }
+        # Lift the parent's own spec to the top level of the document,
+        # keeping its deterministic UUID as the top-level "id": Oscar seeds
+        # its deserializer registry from that id, so elements sent in later
+        # payloads (whose _refs carry the same UUID) share this parent.
+        doc = {"_ns": {"Oscar": [OSCAR_NS_URL, OSCAR_NS_VERSION]}}
+        if isinstance(params, str):
+            spec = refs.pop(params)
+            doc["id"] = params
+        else:
+            spec = params
+        doc["_type"] = spec["_type"]
         if "data" in spec:
             doc["data"] = spec["data"]
         if refs:

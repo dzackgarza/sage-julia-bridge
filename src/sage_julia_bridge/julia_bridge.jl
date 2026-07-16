@@ -157,10 +157,11 @@ function try_mrdi(x)
     catch
         return nothing
     end
-    doc = JSON.parse(String(take!(io)))
+    raw = String(take!(io))
+    doc = JSON.parse(raw)
     names = walk_type_names!(String[], doc, false)
     issubset(Set(names), MRDI_WHITELIST) || return nothing
-    return "{\"type\":\"mrdi\",\"data\":" * JSON.json(doc) * "}"
+    return "{\"type\":\"mrdi\",\"data\":" * raw * "}"
 end
 
 # wrap=true: uncovered values become handles (sage()/call() results).
