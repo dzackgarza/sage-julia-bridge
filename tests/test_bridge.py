@@ -159,6 +159,7 @@ class JuliaBridgeTest(unittest.TestCase):
         # A real subprocess speaking broken protocol over real pipes: the
         # shim answers the startup ping with each malformed frame class
         # (short ok reply, short err reply, unknown status).
+        import shlex
         import sys
         import tempfile
 
@@ -167,7 +168,7 @@ class JuliaBridgeTest(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as tmp:
                     shim = Path(tmp) / "shim.py"
                     shim.write_text(f"import sys\nsys.stdin.readline()\nsys.stdout.write({reply!r} + '\\n')\nsys.stdout.flush()\n")
-                    bridge = Julia(command=f"{sys.executable} {shim}")
+                    bridge = Julia(command=f"{shlex.quote(sys.executable)} {shlex.quote(str(shim))}")
                     with self.assertRaises(JuliaProtocolError):
                         bridge.eval("1 + 1")
                     bridge.quit()
@@ -177,6 +178,7 @@ class JuliaBridgeTest(unittest.TestCase):
         # answers the startup ping correctly, then serves the bogus node,
         # so the rejection is proved through the public sage() path.
         import base64
+        import shlex
         import sys
         import tempfile
 
@@ -196,7 +198,7 @@ class JuliaBridgeTest(unittest.TestCase):
                 "    sys.stdout.write(reply + '\\n')\n"
                 "    sys.stdout.flush()\n"
             )
-            bridge = Julia(command=f"{sys.executable} {shim}")
+            bridge = Julia(command=f"{shlex.quote(sys.executable)} {shlex.quote(str(shim))}")
             with self.assertRaises(JuliaProtocolError):
                 bridge.sage("1 + 1")
             bridge.quit()
