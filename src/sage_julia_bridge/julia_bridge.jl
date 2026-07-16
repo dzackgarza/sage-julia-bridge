@@ -32,11 +32,13 @@ json_string(s::AbstractString) = "\"" * json_escape(s) * "\""
 # commutative rings and QQ is its prime field, so these four parents admit a
 # unique identification with their Base models; the conversion is lossless and
 # the existing Integer/Rational/AbstractMatrix branches handle the rest.
-# Resolved at encode time because the worker starts before `using Oscar`;
-# Nemo symbols must not be referenced at parse time.
+# Resolved at encode time because the worker starts before Oscar is loaded;
+# Nemo symbols must not be referenced at parse time. Nemo is recovered from
+# the value's own type so qualified loads (`import Oscar`) work without a
+# Main.Nemo binding.
 function nemo_to_base(x)
-    isdefined(Main, :Nemo) || return nothing
-    Nemo = Main.Nemo
+    Nemo = parentmodule(typeof(x))
+    nameof(Nemo) === :Nemo || return nothing
     x isa Nemo.ZZRingElem && return BigInt(x)
     x isa Nemo.QQFieldElem && return Rational{BigInt}(x)
     x isa Nemo.ZZMatrix && return Matrix{BigInt}(x)
