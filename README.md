@@ -11,16 +11,20 @@ The bridge is intentionally small:
 - convert a small set of common values between Julia and Sage
 - let Sage load Julia packages such as Oscar out of process
 
-Supported structured conversions (both directions):
+Supported structured conversions (both directions, parent-aware — see
+`docs/wire-format.md` for the pinned grammar):
 
-- integers
-- rationals
-- vectors
-- matrices
-- strings
-- booleans
-- `None` / `nothing`
-- Oscar/Nemo integers, rationals, and matrices over ZZ/QQ (converted exactly)
+- integers, rationals, strings, booleans, `None` / `nothing`
+- lists/tuples (containers stay containers)
+- `Zmod(n)`, `GF(p)`, and `GF(p^n)` with its explicit defining modulus
+- univariate and multivariate polynomial rings over the supported bases
+  (multivariate rings are identified with degrevlex order; other Sage term
+  orders are rejected on input)
+- matrices over every supported base ring, including zero matrices
+- the parent rings themselves (e.g. passing Sage `ZZ` or `GF(7)` to `call`)
+
+Elements decoded from one Julia session share reconstructed parents, so
+arithmetic between round-tripped values works on both sides.
 
 `set(...)` and `call(...)` are protocol operations: values travel as data and
 are never interpolated into Julia source. Any result outside the conversions

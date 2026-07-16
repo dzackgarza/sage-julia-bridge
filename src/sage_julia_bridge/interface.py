@@ -22,22 +22,16 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 from sage.matrix.constructor import matrix
-from sage.modules.free_module_element import vector
 from sage.rings.integer_ring import ZZ
 from sage.rings.rational_field import QQ
 from sage.structure.element import Matrix, Vector
 
+from sage_julia_bridge.errors import JuliaError, JuliaProtocolError
+from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
+
 type StructuredValue = dict[str, object]
 
 _JULIA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
-
-
-class JuliaError(RuntimeError):
-    """Base exception for the Julia bridge."""
-
-
-class JuliaProtocolError(JuliaError):
-    """Raised when the Julia bridge returns malformed data."""
 
 
 class BridgeResponse(BaseModel):
@@ -245,6 +239,12 @@ class Julia:
             return {"type": "bool", "value": value}
         if isinstance(value, str):
             return {"type": "string", "value": value}
+        # Parent-carrying algebra travels as mrdi. This runs before the
+        # numeric branches so e.g. GF(p) elements can never be flattened
+        # to bare integers by a numbers-ABC registration.
+        mrdi_doc = encode_mrdi(value)
+        if mrdi_doc is not None:
+            return {"type": "mrdi", "data": mrdi_doc}
         if isinstance(value, Integral):
             return {"type": "int", "value": str(int(value))}
         if isinstance(value, Rational):
@@ -300,10 +300,13 @@ class Julia:
         if kind == "rational":
             return QQ(ZZ(data["num"])) / QQ(ZZ(data["den"]))
         if kind == "vector":
-            return vector([self._decode_value(item, display) for item in data["data"]])
+            # Containers are containers (docs/wire-format.md).
+            return [self._decode_value(item, display) for item in data["data"]]
         if kind == "matrix":
             entries = [self._decode_value(item, display) for item in data["data"]]
             return matrix(data["nrows"], data["ncols"], entries)
+        if kind == "mrdi":
+            return decode_mrdi(data["data"])
         if kind == "handle":
             return JuliaHandle(self, data["id"], data["julia_type"], data["display"])
         if kind == "unsupported":
