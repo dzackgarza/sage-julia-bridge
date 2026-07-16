@@ -38,9 +38,9 @@ function nemo_to_base(x)
     isdefined(Main, :Nemo) || return nothing
     Nemo = Main.Nemo
     x isa Nemo.ZZRingElem && return BigInt(x)
-    x isa Nemo.QQFieldElem && return Rational(x)
-    x isa Nemo.ZZMatrix && return Matrix(x)
-    x isa Nemo.QQMatrix && return Matrix(x)
+    x isa Nemo.QQFieldElem && return Rational{BigInt}(x)
+    x isa Nemo.ZZMatrix && return Matrix{BigInt}(x)
+    x isa Nemo.QQMatrix && return Matrix{Rational{BigInt}}(x)
     return nothing
 end
 
