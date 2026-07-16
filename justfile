@@ -1,47 +1,28 @@
-# sage-julia-bridge - QC delegation
+# sage-julia-bridge - QC delegation (contract: ~/ai-review-ci/justfiles/sage.just setup)
 
-export PYTHONPATH := "."
-export SAGE_PYTEST := "1"
+# ai-review-ci contract variables consumed by doctor and workflow installers.
+ai_review_ci_schema_version := "1"
+ai_review_ci_profile := "sage"
+ai_review_ci_ref := "main"
+ai_review_ci_release_channel := "main"
+ai_review_ci_workflow_template_version := "1"
+ai_review_ci_local_delegation := "global-justfile"
+ai_review_ci_default_branch := "main"
 
 default:
     @just --list
 
-[private]
-_clean:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd {{justfile_directory()}}
-    find . -path './.worktrees' -prune -o -type f -name '*.orig' -exec rm -f {} +
+# Three-tier QC per the ai-review-ci Sage wiring contract.
+test-commit:
+    @just -f ~/ai-review-ci/justfiles/sage.just -d . test-commit
 
-test:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd {{justfile_directory()}}
-    just _clean
-    export PYTHONPATH="."
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _normalize
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _no-bypass
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _coverage
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _diff-cover
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _vulture
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _deptry
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _semgrep
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _ast-grep
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _jscpd
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _lizard
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _import-linter
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _codeql
-    export PYTHONPATH=".:/home/dzack/miniforge3/envs/sage/lib/python3.12/site-packages"
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _slop
-    export PYTHONPATH="."
-    just -f /home/dzack/ai/quality-control/justfile -d {{justfile_directory()}} _grain
-    just _clean
+test-push:
+    @just -f ~/ai-review-ci/justfiles/sage.just -d . test-push
 
-test-ci: test
-    #!/usr/bin/env bash
-    set -euo pipefail
-    cd {{justfile_directory()}}
-    just test
+test-ci:
+    @just -f ~/ai-review-ci/justfiles/sage.just -d . test-ci
+
+test: test-push
 
 # Full bootstrap: Python package into Sage + Julia deps/artifacts + Oscar verification.
 setup: preflight install julia-deps

@@ -19,6 +19,7 @@ import threading
 from collections import deque
 from numbers import Integral, Rational
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 from sage.matrix.constructor import matrix
@@ -29,7 +30,7 @@ from sage.structure.element import Matrix, Vector
 from sage_julia_bridge.errors import JuliaError, JuliaProtocolError
 from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
 
-type StructuredValue = dict[str, object]
+type StructuredValue = dict[str, Any]
 
 _JULIA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
 
@@ -53,9 +54,7 @@ class JuliaHandle:
     materialization and raises TypeError if the value is still uncovered.
     """
 
-    def __init__(
-        self, bridge: Julia, handle_id: int, julia_type: str, display: str
-    ) -> None:
+    def __init__(self, bridge: Julia, handle_id: int, julia_type: str, display: str) -> None:
         self._bridge = bridge
         self._id = handle_id
         self._generation = bridge._generation
@@ -68,11 +67,9 @@ class JuliaHandle:
     def _assert_current(self) -> None:
         # Ids restart with each worker process; a stale id would silently
         # resolve to a different object in the new worker's table.
-        assert self._generation == self._bridge._generation, (
-            f"stale handle from a previous Julia worker: {self!r}"
-        )
+        assert self._generation == self._bridge._generation, f"stale handle from a previous Julia worker: {self!r}"
 
-    def sage(self) -> object:
+    def sage(self) -> Any:
         self._assert_current()
         response = self._bridge._request("materialize", str(self._id))
         return self._bridge._decode_value(response.structured, response.display)
@@ -119,10 +116,7 @@ class Julia:
         command = shutil.which("julia")
         if command:
             return command
-        msg = (
-            "Julia executable not found; "
-            "set SAGE_JULIA_COMMAND or install Julia via juliaup"
-        )
+        msg = "Julia executable not found; set SAGE_JULIA_COMMAND or install Julia via juliaup"
         raise JuliaError(msg)
 
     def _command_argv(self) -> list[str]:
@@ -269,24 +263,17 @@ class Julia:
                 "data": [self._encode_value(entry) for entry in value],
             }
         if isinstance(value, Matrix):
-            entries = [
-                self._encode_value(value[i, j])
-                for i in range(value.nrows())
-                for j in range(value.ncols())
-            ]
+            entries = [self._encode_value(value[i, j]) for i in range(value.nrows()) for j in range(value.ncols())]
             return {
                 "type": "matrix",
                 "nrows": value.nrows(),
                 "ncols": value.ncols(),
                 "data": entries,
             }
-        msg = (
-            f"unsupported Julia bridge input type: {type(value).__name__}; "
-            "use eval(...) with Julia source for values outside the structured codec"
-        )
+        msg = f"unsupported Julia bridge input type: {type(value).__name__}; use eval(...) with Julia source for values outside the structured codec"
         raise TypeError(msg)
 
-    def _decode_value(self, payload: str | StructuredValue, display: str) -> object:
+    def _decode_value(self, payload: str | StructuredValue, display: str) -> Any:
         data = json.loads(payload) if isinstance(payload, str) else payload
         kind = data["type"]
         if kind == "nothing":
@@ -311,10 +298,7 @@ class Julia:
             return JuliaHandle(self, data["id"], data["julia_type"], data["display"])
         if kind == "unsupported":
             julia_type = data["julia_type"]
-            msg = (
-                f"cannot convert Julia value of type {julia_type} to Sage; "
-                f"use eval(...) instead\n{display}"
-            )
+            msg = f"cannot convert Julia value of type {julia_type} to Sage; use eval(...) instead\n{display}"
             raise TypeError(msg)
         raise JuliaProtocolError(f"unknown Julia value type: {kind!r}")
 
@@ -322,11 +306,11 @@ class Julia:
         response = self._request("exec", code)
         return self._merge_text(response.display, response.stdout, response.stderr)
 
-    def sage(self, code: str) -> object:
+    def sage(self, code: str) -> Any:
         response = self._request("value", code)
         return self._decode_value(response.structured, response.display)
 
-    def __call__(self, code: str) -> object:
+    def __call__(self, code: str) -> Any:
         return self.sage(code)
 
     def set(self, var: str, value: object) -> None:
@@ -337,17 +321,15 @@ class Julia:
     def get(self, var: str) -> str:
         return self.eval(var)
 
-    def get_sage(self, var: str) -> object:
+    def get_sage(self, var: str) -> Any:
         return self.sage(var)
 
-    def call(self, function: str, *args: object, **kwds: object) -> object:
+    def call(self, function: str, *args: object, **kwds: object) -> Any:
         payload = json.dumps(
             {
                 "function": function,
                 "args": [self._encode_value(arg) for arg in args],
-                "kwargs": {
-                    key: self._encode_value(value) for key, value in kwds.items()
-                },
+                "kwargs": {key: self._encode_value(value) for key, value in kwds.items()},
             }
         )
         response = self._request("call", payload)
