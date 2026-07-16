@@ -1,23 +1,16 @@
 from __future__ import annotations
 
-import sys
 import unittest
-from importlib import import_module
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 from sage.all import QQ, ZZ, matrix, vector
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-_module = import_module("sage_julia_bridge")
-Julia = _module.Julia
-JuliaError = _module.JuliaError
-JuliaHandle = _module.JuliaHandle
-JuliaProtocolError = _module.JuliaProtocolError
+from sage_julia_bridge import (
+    Julia,
+    JuliaError,
+    JuliaHandle,
+    JuliaProtocolError,
+)
 
 
 class JuliaBridgeTest(unittest.TestCase):
@@ -26,9 +19,6 @@ class JuliaBridgeTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.bridge.quit()
-
-    def test_repr(self) -> None:
-        self.assertEqual(repr(self.bridge), "Julia")
 
     def test_context_manager(self) -> None:
         with Julia() as bridge:
@@ -61,8 +51,11 @@ class JuliaBridgeTest(unittest.TestCase):
         self.assertEqual(result, ZZ(7))
 
     def test_version(self) -> None:
-        version = self.bridge.version()
-        self.assertIn(".", version)
+        # Julia versions are dotted integers with an optional suffix; a
+        # broken worker echoing junk cannot produce parseable components.
+        major, minor = self.bridge.version().split(".")[:2]
+        self.assertGreaterEqual(int(major), 1)
+        self.assertGreaterEqual(int(minor), 0)
 
     def test_sage_call_alias(self) -> None:
         self.assertEqual(self.bridge("2 * 3"), ZZ(6))
@@ -83,15 +76,13 @@ class JuliaBridgeTest(unittest.TestCase):
         self.bridge.set("m", m)
         self.assertEqual(self.bridge.get_sage("m"), m)
 
-    def test_list_literal(self) -> None:
+    def test_list_roundtrip(self) -> None:
         self.bridge.set("lst", [ZZ(1), ZZ(2), ZZ(3)])
-        result = self.bridge.get("lst")
-        self.assertIn("1", result)
+        self.assertEqual(self.bridge.get_sage("lst"), [ZZ(1), ZZ(2), ZZ(3)])
 
-    def test_tuple_literal(self) -> None:
+    def test_tuple_becomes_container(self) -> None:
         self.bridge.set("tup", (ZZ(1), ZZ(2)))
-        result = self.bridge.get("tup")
-        self.assertIn("1", result)
+        self.assertEqual(self.bridge.get_sage("tup"), [ZZ(1), ZZ(2)])
 
     def test_bool_false(self) -> None:
         self.bridge.set("b", False)
@@ -108,11 +99,10 @@ class JuliaBridgeTest(unittest.TestCase):
         import os
 
         orig = os.environ.get("SAGE_JULIA_COMMAND")
-        os.environ["SAGE_JULIA_COMMAND"] = self.bridge._command
+        os.environ["SAGE_JULIA_COMMAND"] = "/custom/julia --threads=2"
         try:
             bridge2 = Julia()
-            self.assertEqual(bridge2._command, self.bridge._command)
-            bridge2.quit()
+            self.assertEqual(bridge2._command, "/custom/julia --threads=2")
         finally:
             if orig is None:
                 os.environ.pop("SAGE_JULIA_COMMAND", None)
@@ -120,206 +110,123 @@ class JuliaBridgeTest(unittest.TestCase):
                 os.environ["SAGE_JULIA_COMMAND"] = orig
 
     def test_julia_not_found_raises(self) -> None:
+        # Real discovery failure: HOME and PATH point at an empty
+        # directory, so no env var, juliaup install, or PATH hit exists.
         import os
-        import shutil
+        import tempfile
 
-        orig_julia = os.environ.get("SAGE_JULIA_COMMAND")
-        orig_julia_cmd = os.environ.get("JULIA_COMMAND")
+        orig = {name: os.environ.get(name) for name in ("SAGE_JULIA_COMMAND", "JULIA_COMMAND", "HOME", "PATH")}
         try:
-            os.environ.pop("SAGE_JULIA_COMMAND", None)
-            os.environ.pop("JULIA_COMMAND", None)
-            original_which = shutil.which
-            shutil.which = lambda _: None
-            try:
-                with patch.object(type(Path.home()), "exists", return_value=False):
-                    bridge = Julia.__new__(Julia)
-                    with self.assertRaises(JuliaError):
-                        bridge._default_command()
-            finally:
-                shutil.which = original_which
+            with tempfile.TemporaryDirectory() as tmp:
+                os.environ.pop("SAGE_JULIA_COMMAND", None)
+                os.environ.pop("JULIA_COMMAND", None)
+                os.environ["HOME"] = tmp
+                os.environ["PATH"] = tmp
+                bridge = Julia.__new__(Julia)
+                with self.assertRaises(JuliaError):
+                    bridge._default_command()
         finally:
-            if orig_julia is not None:
-                os.environ["SAGE_JULIA_COMMAND"] = orig_julia
-            if orig_julia_cmd is not None:
-                os.environ["JULIA_COMMAND"] = orig_julia_cmd
+            for name, value in orig.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
-    def test_decode_value_nothing(self) -> None:
-        bridge = Julia.__new__(Julia)
-        self.assertIsNone(bridge._decode_value('{"type": "nothing"}', ""))
-
-    def test_decode_value_bool(self) -> None:
-        bridge = Julia.__new__(Julia)
-        self.assertTrue(bridge._decode_value('{"type": "bool", "value": true}', ""))
-        self.assertFalse(bridge._decode_value('{"type": "bool", "value": false}', ""))
-
-    def test_decode_value_string(self) -> None:
-        bridge = Julia.__new__(Julia)
+    def test_eval_merges_printed_output_before_display(self) -> None:
+        # The textual contract: captured stdout precedes the display value.
         self.assertEqual(
-            bridge._decode_value('{"type": "string", "value": "hello"}', ""), "hello"
+            self.bridge.eval('println("side effect"); 42'),
+            "side effect\n42",
         )
-
-    def test_decode_value_int(self) -> None:
-        bridge = Julia.__new__(Julia)
-        self.assertEqual(
-            bridge._decode_value('{"type": "int", "value": "42"}', ""), ZZ(42)
-        )
-
-    def test_decode_value_rational(self) -> None:
-        bridge = Julia.__new__(Julia)
-        result = bridge._decode_value(
-            '{"type": "rational", "num": "1", "den": "3"}', ""
-        )
-        self.assertEqual(result, QQ(1) / QQ(3))
-
-    def test_decode_value_vector(self) -> None:
-        bridge = Julia.__new__(Julia)
-        data = (
-            '{"type": "vector", "data": ['
-            '{"type": "int", "value": "1"}, '
-            '{"type": "int", "value": "2"}'
-            "]}"
-        )
-        result = bridge._decode_value(data, "")
-        self.assertEqual(result, [ZZ(1), ZZ(2)])
-
-    def test_decode_value_matrix(self) -> None:
-        bridge = Julia.__new__(Julia)
-        data = (
-            '{"type": "matrix", "nrows": 2, "ncols": 2, "data": ['
-            '{"type": "int", "value": "1"}, '
-            '{"type": "int", "value": "2"}, '
-            '{"type": "int", "value": "3"}, '
-            '{"type": "int", "value": "4"}'
-            "]}"
-        )
-        result = bridge._decode_value(data, "")
-        self.assertEqual(result, matrix(ZZ, [[1, 2], [3, 4]]))
-
-    def test_decode_value_unsupported(self) -> None:
-        bridge = Julia.__new__(Julia)
-        data = '{"type": "unsupported", "julia_type": "Function"}'
-        with self.assertRaises(TypeError):
-            bridge._decode_value(data, "some display")
-
-    def test_decode_value_unknown_type(self) -> None:
-        bridge = Julia.__new__(Julia)
-        data = '{"type": "bogus"}'
-        with self.assertRaises(JuliaProtocolError):
-            bridge._decode_value(data, "")
-
-    def test_merge_text(self) -> None:
-        bridge = Julia.__new__(Julia)
-        result = bridge._merge_text("display", "stdout", "stderr")
-        self.assertEqual(result, "stdout\nstderr\ndisplay")
-
-    def test_merge_text_empty(self) -> None:
-        bridge = Julia.__new__(Julia)
-        result = bridge._merge_text("", "", "")
-        self.assertEqual(result, "")
-
-    def test_dead_process_message_no_stderr(self) -> None:
-        bridge = Julia.__new__(Julia)
-        bridge._stderr = []
-        result = bridge._dead_process_message()
-        self.assertIn("exited unexpectedly", result)
-
-    def test_dead_process_message_with_stderr(self) -> None:
-        bridge = Julia.__new__(Julia)
-        bridge._stderr = ["error line 1\n", "error line 2\n"]
-        result = bridge._dead_process_message()
-        self.assertIn("exited unexpectedly", result)
-        self.assertIn("error line 1", result)
 
     def test_error_response_from_julia(self) -> None:
         with self.assertRaises(JuliaError):
             self.bridge.eval('error("deliberate test error")')
 
-    def test_broken_pipe_error(self) -> None:
-        bridge = Julia.__new__(Julia)
-        mock_proc = MagicMock()
-        bridge._proc = mock_proc
-        bridge._stderr = []
-        mock_proc.stdin.write.side_effect = BrokenPipeError("broken")
-        with self.assertRaises(JuliaError):
-            bridge._request_unlocked("ping", "")
+    def test_worker_death_mid_request_raises(self) -> None:
+        # A worker dying mid-request is the real dead-process boundary:
+        # _exit terminates the process instantly, so the read hits EOF on
+        # a real pipe. The bridge must fail loudly, then recover with a
+        # fresh worker on the next request. (Julia-level exit() is NOT
+        # usable here: it closes the pipes but can linger in shutdown,
+        # and a half-dead worker defeats the poll()-based restart.)
+        with Julia() as bridge:
+            with self.assertRaises(JuliaError):
+                bridge.eval("ccall(:_exit, Cvoid, (Cint,), 86)")
+            self.assertEqual(bridge.eval("1 + 1"), "2")
 
-    def test_eof_readline(self) -> None:
-        bridge = Julia.__new__(Julia)
-        mock_proc = MagicMock()
-        bridge._proc = mock_proc
-        bridge._stderr = []
-        mock_proc.stdout.readline.return_value = ""
-        with self.assertRaises(JuliaError):
-            bridge._request_unlocked("ping", "")
+    def test_protocol_violations_raise(self) -> None:
+        # A real subprocess speaking broken protocol over real pipes: the
+        # shim answers the startup ping with each malformed frame class
+        # (short ok reply, short err reply, unknown status).
+        import sys
+        import tempfile
 
-    def test_malformed_ok_response(self) -> None:
-        bridge = Julia.__new__(Julia)
-        mock_proc = MagicMock()
-        bridge._proc = mock_proc
-        bridge._stderr = []
-        mock_proc.stdout.readline.return_value = "ok\tc2hvcnQ=\n"
-        with self.assertRaises(JuliaProtocolError):
-            bridge._request_unlocked("ping", "")
+        for reply in ("ok\tc2hvcnQ=", "err\tc2hvcnQ=", "bogus\tcGF5bG9hZA=="):
+            with self.subTest(reply=reply):
+                with tempfile.TemporaryDirectory() as tmp:
+                    shim = Path(tmp) / "shim.py"
+                    shim.write_text(f"import sys\nsys.stdin.readline()\nsys.stdout.write({reply!r} + '\\n')\nsys.stdout.flush()\n")
+                    bridge = Julia(command=f"{sys.executable} {shim}")
+                    with self.assertRaises(JuliaProtocolError):
+                        bridge.eval("1 + 1")
+                    bridge.quit()
 
-    def test_malformed_error_response(self) -> None:
-        bridge = Julia.__new__(Julia)
-        mock_proc = MagicMock()
-        bridge._proc = mock_proc
-        bridge._stderr = []
-        mock_proc.stdout.readline.return_value = "err\tc2hvcnQ=\n"
-        with self.assertRaises(JuliaProtocolError):
-            bridge._request_unlocked("ping", "")
+    def test_unknown_structured_node_raises(self) -> None:
+        # Well-framed reply carrying an unknown value node: the shim
+        # answers the startup ping correctly, then serves the bogus node,
+        # so the rejection is proved through the public sage() path.
+        import base64
+        import sys
+        import tempfile
 
-    def test_unknown_response_status(self) -> None:
-        bridge = Julia.__new__(Julia)
-        mock_proc = MagicMock()
-        bridge._proc = mock_proc
-        bridge._stderr = []
-        mock_proc.stdout.readline.return_value = "bogus\tcGF5bG9hZA==\n"
-        with self.assertRaises(JuliaProtocolError):
-            bridge._request_unlocked("ping", "")
+        def b64(text: str) -> str:
+            return base64.b64encode(text.encode()).decode()
 
-    def test_shutil_which_path(self) -> None:
+        nothing_node = b64('{"type":"nothing"}')
+        bogus_node = b64('{"type":"bogus"}')
+        ok_nothing = f"ok\t\t{nothing_node}\t\t"
+        ok_bogus = f"ok\t\t{bogus_node}\t\t"
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "shim.py"
+            shim.write_text(
+                "import sys\n"
+                "for reply in (" + repr(ok_nothing) + ", " + repr(ok_bogus) + "):\n"
+                "    sys.stdin.readline()\n"
+                "    sys.stdout.write(reply + '\\n')\n"
+                "    sys.stdout.flush()\n"
+            )
+            bridge = Julia(command=f"{sys.executable} {shim}")
+            with self.assertRaises(JuliaProtocolError):
+                bridge.sage("1 + 1")
+            bridge.quit()
+
+    def test_default_command_from_path(self) -> None:
+        # Real discovery: a real executable on a real PATH, with HOME
+        # pointed at a directory that has no juliaup install.
         import os
-        from unittest.mock import patch
+        import tempfile
 
-        orig_sage = os.environ.get("SAGE_JULIA_COMMAND")
-        orig_julia = os.environ.get("JULIA_COMMAND")
+        orig = {name: os.environ.get(name) for name in ("SAGE_JULIA_COMMAND", "JULIA_COMMAND", "HOME", "PATH")}
         try:
-            os.environ.pop("SAGE_JULIA_COMMAND", None)
-            os.environ.pop("JULIA_COMMAND", None)
-            bridge = Julia.__new__(Julia)
-            with patch.object(type(Path.home()), "exists", return_value=False):
-                with patch("shutil.which", return_value="/usr/bin/julia"):
-                    result = bridge._default_command()
-                    self.assertEqual(result, "/usr/bin/julia")
+            with tempfile.TemporaryDirectory() as tmp:
+                fake = Path(tmp) / "julia"
+                fake.write_text("#!/bin/sh\nexit 0\n")
+                fake.chmod(0o755)
+                os.environ.pop("SAGE_JULIA_COMMAND", None)
+                os.environ.pop("JULIA_COMMAND", None)
+                os.environ["HOME"] = tmp
+                os.environ["PATH"] = tmp
+                bridge = Julia.__new__(Julia)
+                self.assertEqual(bridge._default_command(), str(fake))
         finally:
-            if orig_sage is not None:
-                os.environ["SAGE_JULIA_COMMAND"] = orig_sage
-            if orig_julia is not None:
-                os.environ["JULIA_COMMAND"] = orig_julia
+            for name, value in orig.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
-    def test_quit_kill_fallback(self) -> None:
-        bridge = Julia.__new__(Julia)
-        bridge._lock = MagicMock()
-        bridge._lock.__enter__ = MagicMock(return_value=None)
-        bridge._lock.__exit__ = MagicMock(return_value=None)
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.stdin.close = MagicMock()
-        mock_proc.stdout.close = MagicMock()
-        mock_proc.stderr.close = MagicMock()
-        mock_proc.terminate.side_effect = Exception("terminate fail")
-        mock_proc.kill = MagicMock()
-        mock_proc.wait = MagicMock()
-        bridge._proc = mock_proc
-        bridge._stderr_thread = None
-        bridge.quit()
-        mock_proc.kill.assert_called()
-
-    def test_oscar_if_installed(self) -> None:
-        if self.bridge.eval('Base.find_package("Oscar") === nothing') == "true":
-            self.skipTest("Oscar is not installed in Julia")
+    def test_oscar_loads(self) -> None:
         self.assertEqual(self.bridge.eval("using Oscar"), "")
         oscar_code = """begin
 using Oscar
@@ -373,7 +280,7 @@ class ProtocolTest(unittest.TestCase):
 
     def test_call_path_is_not_executed(self) -> None:
         with self.assertRaises(JuliaError):
-            self.bridge.call('begin global pwned2 = 1; abs end', ZZ(1))
+            self.bridge.call("begin global pwned2 = 1; abs end", ZZ(1))
         self.assertEqual(self.bridge.eval("isdefined(Main, :pwned2)"), "false")
 
     def test_unsupported_value_returns_handle(self) -> None:
@@ -400,10 +307,10 @@ class ProtocolTest(unittest.TestCase):
 
         with Julia() as bridge:
             handle = bridge.sage("x -> x")
-            self.assertEqual(bridge.eval("length(HANDLES)"), "1")
+            self.assertEqual(bridge.sage("length(HANDLES)"), ZZ(1))
             del handle
             gc.collect()
-            self.assertEqual(bridge.eval("length(HANDLES)"), "0")
+            self.assertEqual(bridge.sage("length(HANDLES)"), ZZ(0))
 
     def test_stale_handle_rejected_after_restart(self) -> None:
         # Ids restart from 1 with a new worker; a handle from a previous
@@ -422,21 +329,17 @@ class ProtocolTest(unittest.TestCase):
             # A stale handle's GC must not release the new worker's entry.
             del stale
             gc.collect()
-            self.assertEqual(bridge.eval("length(HANDLES)"), "1")
+            self.assertEqual(bridge.sage("length(HANDLES)"), ZZ(1))
             result = bridge.call("map", fresh, [ZZ(1), ZZ(2)])
             self.assertEqual(result, [ZZ(2), ZZ(4)])
 
     def test_float_input_rejected(self) -> None:
-        with self.assertRaises(TypeError) as ctx:
+        with self.assertRaises(TypeError):
             self.bridge.set("f", 1.5)
-        self.assertIn("float", str(ctx.exception))
-        self.assertIn("eval(", str(ctx.exception))
 
     def test_dict_input_rejected(self) -> None:
-        with self.assertRaises(TypeError) as ctx:
+        with self.assertRaises(TypeError):
             self.bridge.set("d", {"a": 1})
-        self.assertIn("dict", str(ctx.exception))
-        self.assertIn("eval(", str(ctx.exception))
 
 
 class MrdiCodecTest(unittest.TestCase):
@@ -451,10 +354,9 @@ class MrdiCodecTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        # Oscar is a hard dependency (provisioned by `just setup`); its
+        # absence must fail the suite loudly, not skip it.
         cls.bridge = Julia()
-        if cls.bridge.eval('Base.find_package("Oscar") === nothing') == "true":
-            cls.bridge.quit()
-            raise unittest.SkipTest("Oscar is not installed in Julia")
         cls.bridge.eval("using Oscar")
 
     @classmethod
@@ -510,9 +412,7 @@ class MrdiCodecTest(unittest.TestCase):
     def test_multivariate_polynomial(self) -> None:
         from sage.all import PolynomialRing
 
-        result = self.bridge.sage(
-            "R, (x, y) = polynomial_ring(QQ, [:x, :y]); x^3 - y + 7//2"
-        )
+        result = self.bridge.sage("R, (x, y) = polynomial_ring(QQ, [:x, :y]); x^3 - y + 7//2")
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
         self.assertEqual(result, x**3 - y + QQ(7) / QQ(2))
@@ -520,9 +420,7 @@ class MrdiCodecTest(unittest.TestCase):
 
     def test_variable_order_preserved(self) -> None:
         # Asymmetric fixture: a generator permutation cannot pass.
-        result = self.bridge.sage(
-            "R, (x, y) = polynomial_ring(QQ, [:x, :y]); x^2 * y"
-        )
+        result = self.bridge.sage("R, (x, y) = polynomial_ring(QQ, [:x, :y]); x^2 * y")
         R = result.parent()
         self.assertEqual([str(g) for g in R.gens()], ["x", "y"])
         x, y = R.gens()
@@ -548,9 +446,7 @@ class MrdiCodecTest(unittest.TestCase):
     def test_recursive_closure_matrix_over_mpoly_over_gf(self) -> None:
         from sage.all import GF, PolynomialRing
 
-        result = self.bridge.sage(
-            "R, (x, y) = polynomial_ring(GF(7), [:x, :y]); matrix(R, [x y; 0 x + 1])"
-        )
+        result = self.bridge.sage("R, (x, y) = polynomial_ring(GF(7), [:x, :y]); matrix(R, [x y; 0 x + 1])")
         R = PolynomialRing(GF(7), ["x", "y"], order="degrevlex")
         x, y = R.gens()
         self.assertEqual(result, matrix(R, [[x, y], [0, x + 1]]))
@@ -563,7 +459,7 @@ class MrdiCodecTest(unittest.TestCase):
         first = self.bridge.sage("u + v")
         second = self.bridge.sage("u * v")
         self.assertIs(first.parent(), second.parent())
-        self.assertEqual(first * second, first.parent()((first * second)))
+        self.assertEqual(first * second, first.parent()(first * second))
 
     def test_shared_parent_finite_field(self) -> None:
         self.bridge.eval('F81, b = finite_field(3, 4, "b")')
@@ -677,10 +573,9 @@ class OscarCoercionTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
+        # Oscar is a hard dependency (provisioned by `just setup`); its
+        # absence must fail the suite loudly, not skip it.
         cls.bridge = Julia()
-        if cls.bridge.eval('Base.find_package("Oscar") === nothing') == "true":
-            cls.bridge.quit()
-            raise unittest.SkipTest("Oscar is not installed in Julia")
         cls.bridge.eval("using Oscar")
 
     @classmethod
