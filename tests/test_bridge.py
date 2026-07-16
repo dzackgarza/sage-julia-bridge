@@ -327,5 +327,67 @@ end"""
         self.assertEqual(self.bridge.eval(oscar_code), "x^2 + y^2")
 
 
+class OscarCoercionTest(unittest.TestCase):
+    """Structured sage() coercion of Oscar/Nemo values (issue #1, milestone M1).
+
+    Covers the canonical exact conversions: Nemo.ZZRingElem, Nemo.QQFieldElem,
+    Nemo.ZZMatrix, Nemo.QQMatrix, and vectors of the scalar types. ZZ/QQ admit
+    a unique parent identification, so a parentless wire encoding is exact.
+    """
+
+    bridge: Julia
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = Julia()
+        if cls.bridge.eval('Base.find_package("Oscar") === nothing') == "true":
+            cls.bridge.quit()
+            raise unittest.SkipTest("Oscar is not installed in Julia")
+        cls.bridge.eval("using Oscar")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.quit()
+
+    def test_zz_scalar(self) -> None:
+        result = self.bridge.sage("det(matrix(ZZ,[2 1;1 2]))")
+        self.assertEqual(result, ZZ(3))
+        self.assertIs(result.parent(), ZZ)
+
+    def test_zz_scalar_exceeds_machine_precision(self) -> None:
+        result = self.bridge.sage("factorial(ZZ(30))")
+        self.assertEqual(result, ZZ(30).factorial())
+        self.assertIs(result.parent(), ZZ)
+
+    def test_qq_scalar(self) -> None:
+        result = self.bridge.sage("QQ(1,3)")
+        self.assertEqual(result, QQ(1) / QQ(3))
+        self.assertIs(result.parent(), QQ)
+
+    def test_zz_matrix(self) -> None:
+        result = self.bridge.sage("matrix(ZZ,[1 2;3 4])")
+        self.assertEqual(result, matrix(ZZ, [[1, 2], [3, 4]]))
+        self.assertIs(result.base_ring(), ZZ)
+
+    def test_qq_matrix(self) -> None:
+        result = self.bridge.sage("matrix(QQ,[1 2;3 4])")
+        self.assertEqual(result, matrix(QQ, [[1, 2], [3, 4]]))
+        self.assertIs(result.base_ring(), QQ)
+
+    def test_qq_matrix_nonintegral_entries(self) -> None:
+        result = self.bridge.sage("matrix(QQ,[1//2 2;3 4//3])")
+        expected = matrix(QQ, [[QQ(1) / QQ(2), 2], [3, QQ(4) / QQ(3)]])
+        self.assertEqual(result, expected)
+        self.assertIs(result.base_ring(), QQ)
+
+    def test_vector_of_zz_elements(self) -> None:
+        result = self.bridge.sage("[ZZ(1), ZZ(2), ZZ(3)]")
+        self.assertEqual(result, vector(ZZ, [1, 2, 3]))
+
+    def test_vector_of_qq_elements(self) -> None:
+        result = self.bridge.sage("[QQ(1,2), QQ(3,4)]")
+        self.assertEqual(result, vector(QQ, [QQ(1) / QQ(2), QQ(3) / QQ(4)]))
+
+
 if __name__ == "__main__":
     unittest.main()
