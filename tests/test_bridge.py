@@ -388,6 +388,15 @@ class OscarCoercionTest(unittest.TestCase):
         result = self.bridge.sage("[QQ(1,2), QQ(3,4)]")
         self.assertEqual(result, vector(QQ, [QQ(1) / QQ(2), QQ(3) / QQ(4)]))
 
+    def test_qualified_import_oscar(self) -> None:
+        # `import Oscar` binds only Main.Oscar — Nemo must be resolved from
+        # the value's type, not from a Main binding (PR #2 review).
+        with Julia() as bridge:
+            bridge.eval("import Oscar")
+            result = bridge.sage("Oscar.det(Oscar.matrix(Oscar.ZZ,[2 1;1 2]))")
+            self.assertEqual(result, ZZ(3))
+            self.assertIs(result.parent(), ZZ)
+
 
 if __name__ == "__main__":
     unittest.main()
