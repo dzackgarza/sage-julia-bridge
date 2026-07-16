@@ -134,7 +134,12 @@ class Julia:
     def _ensure_process(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
+        # The bridge's own Julia deps (JSON) live in a repo-scoped project;
+        # Julia's default load-path stacking keeps shared-env packages such
+        # as Oscar loadable alongside it.
+        julia_env = Path(__file__).with_name("julia_env")
         argv = self._command_argv() + [
+            f"--project={julia_env}",
             "--startup-file=no",
             "--history-file=no",
             "--color=no",

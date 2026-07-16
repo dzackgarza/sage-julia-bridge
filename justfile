@@ -64,13 +64,19 @@ preflight:
 install:
     sage -python -m pip install -e .
 
-# Instantiate the Julia environment (downloads missing artifacts) and verify Oscar loads.
+# Instantiate the Julia environments (bridge project + shared env artifacts)
+# and verify the worker's dependencies and Oscar load together.
 julia-deps:
     #!/usr/bin/env bash
     set -euo pipefail
+    cd {{justfile_directory()}}
     julia --startup-file=no --history-file=no --color=no -e '
         using Pkg
-        Pkg.add("JSON")
+        Pkg.instantiate()
+        Pkg.precompile()
+    '
+    julia --project=src/sage_julia_bridge/julia_env --startup-file=no --history-file=no --color=no -e '
+        using Pkg
         Pkg.instantiate()
         Pkg.precompile()
         import JSON
