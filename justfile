@@ -70,10 +70,12 @@ julia-deps:
     set -euo pipefail
     julia --startup-file=no --history-file=no --color=no -e '
         using Pkg
+        Pkg.add("JSON")
         Pkg.instantiate()
         Pkg.precompile()
+        import JSON
         using Oscar
-        println("Oscar ", Oscar.VERSION_NUMBER, " loaded")
+        println("JSON ", pkgversion(JSON), ", Oscar ", Oscar.VERSION_NUMBER, " loaded")
     '
 
 build:
