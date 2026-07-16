@@ -592,8 +592,15 @@ class MrdiCodecTest(unittest.TestCase):
         ]
         for a, b in fixtures:
             with self.subTest(parent=str(a.parent())):
-                self.assertEqual(self.bridge.call("+", a, b), a + b)
-                self.assertEqual(self.bridge.call("*", a, b), a * b)
+                total = self.bridge.call("+", a, b)
+                self.assertEqual(total, a + b)
+                # Parent equality, not just coercion equality: ZZ(8) ==
+                # Zmod(12)(8) coerces True, so a parent-losing encoder
+                # would pass a value-only check.
+                self.assertEqual(total.parent(), a.parent())
+                product = self.bridge.call("*", a, b)
+                self.assertEqual(product, a * b)
+                self.assertEqual(product.parent(), a.parent())
                 self.assertEqual(self.bridge.call("-", a), -a)
                 zero = a.parent()(0)
                 one = a.parent()(1)
@@ -720,14 +727,24 @@ class OscarCoercionTest(unittest.TestCase):
         self.assertEqual(result, [QQ(1) / QQ(2), QQ(3) / QQ(4)])
 
     def test_handle_roundtrip_through_oscar(self) -> None:
-        # An Oscar ring is codec-uncovered -> handle; using it as a call
-        # argument and coercing the ZZMatrix result back closes the loop.
-        zz_ring = self.bridge.sage("ZZ")
-        self.assertIsInstance(zz_ring, JuliaHandle)
+        # A free module is codec-uncovered (Oscar cannot serialize it) ->
+        # handle; using it as a call argument closes the loop.
+        module = self.bridge.sage("free_module(QQ, 2)")
+        self.assertIsInstance(module, JuliaHandle)
+        self.assertEqual(self.bridge.call("rank", module), ZZ(2))
+
+    def test_ring_as_call_argument(self) -> None:
+        # Parents are structured values: Sage ZZ crosses as a ZZRing doc.
         m = matrix(ZZ, [[1, 2], [3, 4]])
-        result = self.bridge.call("matrix", zz_ring, m)
+        result = self.bridge.call("matrix", ZZ, m)
         self.assertEqual(result, m)
         self.assertIs(result.base_ring(), ZZ)
+
+    def test_parent_objects_decode(self) -> None:
+        from sage.all import GF
+
+        self.assertIs(self.bridge.sage("ZZ"), ZZ)
+        self.assertIs(self.bridge.sage("GF(7)"), GF(7))
 
     def test_qualified_import_oscar(self) -> None:
         # `import Oscar` binds only Main.Oscar — Nemo must be resolved from

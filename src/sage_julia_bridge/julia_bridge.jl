@@ -100,10 +100,75 @@ function register_handle(x)
     return id
 end
 
+# The mrdi type whitelist from docs/wire-format.md. A serialized value whose
+# document mentions any type outside this set is routed to a handle instead.
+const MRDI_WHITELIST = Set([
+    "ZZRing", "QQField", "ZZRingElem", "QQFieldElem",
+    "Nemo.zzModRing", "Nemo.ZZModRing", "zzModRingElem", "ZZModRingElem",
+    "FiniteField", "FqFieldElem",
+    "PolyRing", "PolyRingElem", "MPolyRing", "MPolyRingElem",
+    "MatSpace", "MatElem",
+    "Vector", "Tuple",
+])
+
+function walk_type_names!(names::Vector{String}, node, in_type::Bool)
+    if node isa AbstractDict
+        if in_type && haskey(node, "name") && node["name"] isa AbstractString
+            push!(names, node["name"])
+        end
+        for (key, value) in node
+            if key == "_type"
+                if value isa AbstractString
+                    push!(names, value)
+                else
+                    walk_type_names!(names, value, true)
+                end
+            elseif key == "params" && in_type
+                walk_type_names!(names, value, true)
+            else
+                walk_type_names!(names, value, false)
+            end
+        end
+    elseif node isa AbstractVector
+        for item in node
+            walk_type_names!(names, item, in_type)
+        end
+    end
+    return names
+end
+
+function assert_mrdi_whitelisted(doc)
+    names = walk_type_names!(String[], doc, false)
+    outside = setdiff(Set(names), MRDI_WHITELIST)
+    isempty(outside) ||
+        error("mrdi payload contains unsupported types: ", join(sort!(collect(outside)), ", "))
+    return nothing
+end
+
+# Serialize via Oscar and emit an mrdi node when the whole document stays
+# inside the pinned subset; nothing means the value takes the handle tier
+# (either Oscar is absent, Oscar cannot serialize it, or a type falls
+# outside the whitelist).
+function try_mrdi(x)
+    isdefined(Main, :Oscar) || return nothing
+    io = IOBuffer()
+    try
+        Main.Oscar.save(io, x)
+    catch
+        return nothing
+    end
+    doc = JSON.parse(String(take!(io)))
+    names = walk_type_names!(String[], doc, false)
+    issubset(Set(names), MRDI_WHITELIST) || return nothing
+    return "{\"type\":\"mrdi\",\"data\":" * JSON.json(doc) * "}"
+end
+
 # wrap=true: uncovered values become handles (sage()/call() results).
 # wrap=false: uncovered values report unsupported (explicit materialization).
 function encode_value(x, wrap::Bool)
     encoded = encode_supported(x)
+    encoded === nothing || return encoded
+    encoded = try_mrdi(x)
     encoded === nothing || return encoded
     if !wrap
         return "{\"type\":\"unsupported\",\"julia_type\":" * json_string(string(typeof(x))) * "}"
@@ -144,6 +209,12 @@ function decode_value(node::AbstractDict)
         id = node["id"]::Int
         haskey(HANDLES, id) || error("unknown handle id: ", id)
         return HANDLES[id]
+    elseif kind == "mrdi"
+        isdefined(Main, :Oscar) ||
+            error("mrdi payload requires Oscar; run eval(\"using Oscar\") first")
+        doc = node["data"]
+        assert_mrdi_whitelisted(doc)
+        return Main.Oscar.load(IOBuffer(JSON.json(doc)))
     end
     error("unknown bridge value type: ", kind)
 end
