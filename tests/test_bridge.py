@@ -404,6 +404,27 @@ class ProtocolTest(unittest.TestCase):
             gc.collect()
             self.assertEqual(bridge.eval("length(HANDLES)"), "0")
 
+    def test_stale_handle_rejected_after_restart(self) -> None:
+        # Ids restart from 1 with a new worker; a handle from a previous
+        # worker must fail loudly, never silently alias a new object
+        # (PR #3 review).
+        import gc
+
+        with Julia() as bridge:
+            stale = bridge.sage("x -> 10 * x")
+            bridge.quit()
+            fresh = bridge.sage("x -> 2 * x")  # restarts worker, id 1 again
+            with self.assertRaises(AssertionError):
+                bridge.call("map", stale, [ZZ(1), ZZ(2)])
+            with self.assertRaises(AssertionError):
+                stale.sage()
+            # A stale handle's GC must not release the new worker's entry.
+            del stale
+            gc.collect()
+            self.assertEqual(bridge.eval("length(HANDLES)"), "1")
+            result = bridge.call("map", fresh, [ZZ(1), ZZ(2)])
+            self.assertEqual(result, vector(ZZ, [2, 4]))
+
     def test_float_input_rejected(self) -> None:
         with self.assertRaises(TypeError) as ctx:
             self.bridge.set("f", 1.5)
