@@ -43,8 +43,24 @@ test-ci: test
     cd {{justfile_directory()}}
     just test
 
+# Full bootstrap: Python package into Sage + Julia deps/artifacts + Oscar verification.
+setup: install julia-deps
+
+# Install the bridge into Sage's Python environment.
 install:
     sage -python -m pip install -e .
+
+# Instantiate the Julia environment (downloads missing artifacts) and verify Oscar loads.
+julia-deps:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    julia --startup-file=no --history-file=no --color=no -e '
+        using Pkg
+        Pkg.instantiate()
+        Pkg.precompile()
+        using Oscar
+        println("Oscar ", Oscar.VERSION_NUMBER, " loaded")
+    '
 
 build:
     uv build

@@ -25,7 +25,14 @@ result and `eval(...)` will return Julia's textual output.
 
 ## Install
 
-Install the package into Sage's Python environment:
+Bootstrap everything (Python package into Sage, plus Julia dependencies and
+artifacts including Oscar):
+
+```bash
+just setup
+```
+
+Or install just the Python package into Sage's environment:
 
 ```bash
 sage -python -m pip install -e .
@@ -64,7 +71,7 @@ bridge.quit()
 All project commands go through `just`:
 
 ```bash
-just install
+just setup
 just test
 just build
 ```
