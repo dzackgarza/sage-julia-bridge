@@ -28,7 +28,29 @@ end
 
 json_string(s::AbstractString) = "\"" * json_escape(s) * "\""
 
+# Canonical exact conversions for Nemo values (issue #1, M1). ZZ is initial in
+# commutative rings and QQ is its prime field, so these four parents admit a
+# unique identification with their Base models; the conversion is lossless and
+# the existing Integer/Rational/AbstractMatrix branches handle the rest.
+# Resolved at encode time because the worker starts before Oscar is loaded;
+# Nemo symbols must not be referenced at parse time. Nemo is recovered from
+# the value's own type so qualified loads (`import Oscar`) work without a
+# Main.Nemo binding.
+function nemo_to_base(x)
+    Nemo = parentmodule(typeof(x))
+    nameof(Nemo) === :Nemo || return nothing
+    x isa Nemo.ZZRingElem && return BigInt(x)
+    x isa Nemo.QQFieldElem && return Rational{BigInt}(x)
+    x isa Nemo.ZZMatrix && return Matrix{BigInt}(x)
+    x isa Nemo.QQMatrix && return Matrix{Rational{BigInt}}(x)
+    return nothing
+end
+
 function encode_supported(x)
+    converted = nemo_to_base(x)
+    if converted !== nothing
+        return encode_supported(converted)
+    end
     if x === nothing
         return "{\"type\":\"nothing\"}"
     elseif x isa Bool
@@ -129,10 +151,13 @@ for line in eachline(stdin)
 
     try
         value, stdout_text, stderr_text = evaluate(payload)
+        # invokelatest: the loop body runs in the world age of script load,
+        # so methods and global bindings introduced by evaluated code (e.g.
+        # `using Oscar`) are invisible to direct calls from here.
         reply([
             "ok",
-            b64(display_text(value)),
-            b64(encode_value(value)),
+            b64(Base.invokelatest(display_text, value)),
+            b64(Base.invokelatest(encode_value, value)),
             b64(stdout_text),
             b64(stderr_text),
         ])
