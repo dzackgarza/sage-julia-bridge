@@ -64,20 +64,31 @@ class JuliaHandle:
     ) -> None:
         self._bridge = bridge
         self._id = handle_id
+        self._generation = bridge._generation
         self._julia_type = julia_type
         self._display = display
 
     def __repr__(self) -> str:
         return f"JuliaHandle<{self._julia_type}>({self._display})"
 
+    def _assert_current(self) -> None:
+        # Ids restart with each worker process; a stale id would silently
+        # resolve to a different object in the new worker's table.
+        assert self._generation == self._bridge._generation, (
+            f"stale handle from a previous Julia worker: {self!r}"
+        )
+
     def sage(self) -> object:
+        self._assert_current()
         response = self._bridge._request("materialize", str(self._id))
         return self._bridge._decode_value(response.structured, response.display)
 
     def __del__(self) -> None:
         # Only enqueue: sending a request here could interleave with an
         # in-flight request on the same pipe (GC runs at arbitrary points).
-        self._bridge._pending_releases.append(self._id)
+        # Stale handles enqueue nothing: the value died with its worker.
+        if self._generation == self._bridge._generation:
+            self._bridge._pending_releases.append(self._id)
 
 
 class Julia:
@@ -91,6 +102,7 @@ class Julia:
         self._stderr: deque[str] = deque(maxlen=200)
         self._stderr_thread: threading.Thread | None = None
         self._pending_releases: deque[int] = deque()
+        self._generation = 0
 
     def __repr__(self) -> str:
         return "Julia"
@@ -148,6 +160,7 @@ class Julia:
         self._stderr.clear()
         # Handle ids die with the worker process they belong to.
         self._pending_releases.clear()
+        self._generation += 1
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -248,6 +261,7 @@ class Julia:
             }
         if isinstance(value, JuliaHandle):
             assert value._bridge is self, "handle belongs to a different Julia bridge"
+            value._assert_current()
             return {"type": "handle", "id": value._id}
         if isinstance(value, (Vector, list, tuple)):
             return {
