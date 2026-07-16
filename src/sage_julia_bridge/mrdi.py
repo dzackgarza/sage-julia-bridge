@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from typing import Any
 
 from sage.matrix.matrix_space import MatrixSpace
 from sage.rings.finite_rings.element_base import FinitePolyExtElement
@@ -101,39 +102,36 @@ def _walk_type_names(node: object, in_type: bool, names: set[str]) -> None:
             _walk_type_names(item, in_type, names)
 
 
-def validate_document(doc: dict) -> None:
+def validate_document(doc: dict[str, Any]) -> None:
     """Schema-layer validation: namespace, version, and type whitelist."""
     ns = doc.get("_ns")
     if not isinstance(ns, dict) or "Oscar" not in ns:
         raise JuliaProtocolError(f"mrdi document lacks an Oscar namespace: {ns!r}")
     version = ns["Oscar"][1] if len(ns["Oscar"]) > 1 else None
     if version != OSCAR_NS_VERSION:
-        raise JuliaProtocolError(
-            f"unsupported mrdi schema version {version!r}; "
-            f"this bridge is pinned to Oscar {OSCAR_NS_VERSION}"
-        )
+        raise JuliaProtocolError(f"unsupported mrdi schema version {version!r}; this bridge is pinned to Oscar {OSCAR_NS_VERSION}")
     names: set[str] = set()
     _walk_type_names(doc, False, names)
     outside = names - WHITELIST
     if outside:
-        raise JuliaProtocolError(
-            f"mrdi document contains types outside the supported subset: "
-            f"{sorted(outside)}"
-        )
+        raise JuliaProtocolError(f"mrdi document contains types outside the supported subset: {sorted(outside)}")
 
 
-def _resolve(spec: object, refs: dict) -> dict:
+def _resolve(spec: object, refs: dict[str, Any]) -> dict[str, Any]:
     """Resolve a params entry to an inline spec dict, following ref UUIDs."""
     if isinstance(spec, str):
         if spec not in refs:
             raise JuliaProtocolError(f"dangling mrdi reference: {spec!r}")
-        return refs[spec]
+        resolved = refs[spec]
+        if not isinstance(resolved, dict):
+            raise JuliaProtocolError(f"malformed mrdi reference target: {spec!r}")
+        return resolved
     if isinstance(spec, dict):
         return spec
     raise JuliaProtocolError(f"malformed mrdi params: {spec!r}")
 
 
-def _decode_parent(spec: dict, refs: dict) -> object:
+def _decode_parent(spec: dict[str, Any], refs: dict[str, Any]) -> Any:
     name = _type_name(spec["_type"])
     if name == "ZZRing":
         return ZZ
@@ -149,16 +147,12 @@ def _decode_parent(spec: dict, refs: dict) -> object:
         modulus_ring = _decode_parent(poly_ring_spec, refs)
         modulus = _element_from_data(modulus_ring, data, refs)
         p = modulus_ring.base_ring().characteristic()
-        return GF(
-            p ** modulus.degree(), EXTENSION_GENERATOR_NAME, modulus=modulus
-        )
+        return GF(p ** modulus.degree(), EXTENSION_GENERATOR_NAME, modulus=modulus)
     if name == "PolyRing":
         base = _decode_parent(_resolve(spec["_type"]["params"], refs), refs)
         symbols = spec["data"]["symbols"]
         if len(symbols) != 1:
-            raise JuliaProtocolError(
-                f"PolyRing must have exactly one symbol: {symbols!r}"
-            )
+            raise JuliaProtocolError(f"PolyRing must have exactly one symbol: {symbols!r}")
         return PolynomialRing(base, symbols[0])
     if name == "MPolyRing":
         base = _decode_parent(_resolve(spec["_type"]["params"], refs), refs)
@@ -166,20 +160,18 @@ def _decode_parent(spec: dict, refs: dict) -> object:
         return PolynomialRing(base, symbols, order="degrevlex")
     if name == "MatSpace":
         base = _decode_parent(_resolve(spec["_type"]["params"], refs), refs)
-        return MatrixSpace(
-            base, ZZ(spec["data"]["nrows"]), ZZ(spec["data"]["ncols"])
-        )
+        return MatrixSpace(base, ZZ(spec["data"]["nrows"]), ZZ(spec["data"]["ncols"]))
     raise JuliaProtocolError(f"unsupported mrdi parent type: {name!r}")
 
 
-def _rational_from_string(raw: str) -> object:
+def _rational_from_string(raw: str) -> Any:
     if "//" in raw:
         num, den = raw.split("//")
         return QQ(ZZ(num)) / QQ(ZZ(den))
     return QQ(ZZ(raw))
 
 
-def _element_from_data(parent: object, raw: object, refs: dict) -> object:
+def _element_from_data(parent: Any, raw: Any, refs: dict[str, Any]) -> Any:
     if parent is ZZ:
         return ZZ(raw)
     if parent is QQ:
@@ -196,17 +188,9 @@ def _element_from_data(parent: object, raw: object, refs: dict) -> object:
         return parent(ZZ(raw))
     if isinstance(parent, MatrixSpace):
         base = parent.base_ring()
-        rows = [
-            [_element_from_data(base, entry, refs) for entry in row]
-            for row in raw
-        ]
-        if len(rows) != parent.nrows() or any(
-            len(row) != parent.ncols() for row in rows
-        ):
-            raise JuliaProtocolError(
-                f"matrix payload shape does not match "
-                f"{parent.nrows()}x{parent.ncols()}"
-            )
+        rows = [[_element_from_data(base, entry, refs) for entry in row] for row in raw]
+        if len(rows) != parent.nrows() or any(len(row) != parent.ncols() for row in rows):
+            raise JuliaProtocolError(f"matrix payload shape does not match {parent.nrows()}x{parent.ncols()}")
         return parent(rows)
     if isinstance(parent, (PolynomialRing_generic, MPolynomialRing_base)):
         # Term shapes: PolyRingElem pairs ["i", c]; MPolyRingElem pairs
@@ -216,21 +200,16 @@ def _element_from_data(parent: object, raw: object, refs: dict) -> object:
         univariate = parent.ngens() == 1
         coeffs = {}
         for exps, coeff in raw:
-            exponents = [int(e) for e in exps] if isinstance(exps, list) else [
-                int(exps)
-            ]
+            exponents = [int(e) for e in exps] if isinstance(exps, list) else [int(exps)]
             if len(exponents) != parent.ngens():
-                raise JuliaProtocolError(
-                    f"exponent vector {exponents} does not match "
-                    f"{parent.ngens()} generators"
-                )
+                raise JuliaProtocolError(f"exponent vector {exponents} does not match {parent.ngens()} generators")
             key = exponents[0] if univariate else tuple(exponents)
             coeffs[key] = _element_from_data(base, coeff, refs)
         return parent(coeffs)
     raise JuliaProtocolError(f"cannot decode element for parent {parent!r}")
 
 
-def decode_mrdi(doc: dict) -> object:
+def decode_mrdi(doc: dict[str, Any]) -> Any:
     validate_document(doc)
     refs = doc.get("_refs", {})
     type_desc = doc["_type"]
@@ -239,6 +218,8 @@ def decode_mrdi(doc: dict) -> object:
     data = doc.get("data")
     if name in PARENT_TYPES:
         return _decode_parent({"_type": type_desc, "data": data}, refs)
+    if data is None:
+        raise JuliaProtocolError(f"mrdi element document lacks data: {name!r}")
     if name == "ZZRingElem":
         return ZZ(data)
     if name == "QQFieldElem":
@@ -288,13 +269,13 @@ def decode_mrdi(doc: dict) -> object:
 _REF_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, OSCAR_NS_URL)
 
 
-def _new_ref(refs: dict, spec: dict) -> str:
+def _new_ref(refs: dict[str, Any], spec: dict[str, Any]) -> str:
     key = str(uuid.uuid5(_REF_NAMESPACE, json.dumps(spec, sort_keys=True)))
     refs[key] = spec
     return key
 
 
-def _encode_parent(parent: object, refs: dict) -> object | None:
+def _encode_parent(parent: Any, refs: dict[str, Any]) -> str | dict[str, Any] | None:
     """Return the params entry for a parent (inline dict or ref UUID)."""
     if parent is ZZ:
         return {"_type": "ZZRing"}
@@ -326,17 +307,12 @@ def _encode_parent(parent: object, refs: dict) -> object | None:
                     "_instance": "FqField",
                     "params": poly_ring_ref,
                 },
-                "data": [
-                    [str(exp), str(int(coeff))]
-                    for exp, coeff in sorted(modulus.dict().items())
-                ],
+                "data": [[str(exp), str(int(coeff))] for exp, coeff in sorted(modulus.dict().items())],
             },
         )
     if isinstance(parent, IntegerModRing_generic):
         modulus = parent.order()
-        ring_type = (
-            "Nemo.zzModRing" if modulus <= MACHINE_WORD_MAX else "Nemo.ZZModRing"
-        )
+        ring_type = "Nemo.zzModRing" if modulus <= MACHINE_WORD_MAX else "Nemo.ZZModRing"
         return {"_type": ring_type, "data": str(modulus)}
     if isinstance(parent, MatrixSpace):
         base_params = _encode_parent(parent.base_ring(), refs)
@@ -379,7 +355,7 @@ def _encode_parent(parent: object, refs: dict) -> object | None:
     return None
 
 
-def _element_data(value: object) -> object:
+def _element_data(value: Any) -> Any:
     parent = value.parent()
     if parent is ZZ:
         return str(value)
@@ -389,25 +365,13 @@ def _element_data(value: object) -> object:
     if isinstance(value, IntegerMod_abstract):
         return str(int(value))
     if isinstance(value, FinitePolyExtElement):
-        return [
-            [str(exp), str(int(coeff))]
-            for exp, coeff in sorted(value.polynomial().dict().items())
-        ]
+        return [[str(exp), str(int(coeff))] for exp, coeff in sorted(value.polynomial().dict().items())]
     if isinstance(value, Polynomial):
-        return [
-            [str(exp), _element_data(coeff)]
-            for exp, coeff in sorted(value.dict().items())
-        ]
+        return [[str(exp), _element_data(coeff)] for exp, coeff in sorted(value.dict().items())]
     if isinstance(value, MPolynomial):
-        return [
-            [[str(e) for e in exps], _element_data(coeff)]
-            for exps, coeff in sorted(value.dict().items())
-        ]
+        return [[[str(e) for e in exps], _element_data(coeff)] for exps, coeff in sorted(value.dict().items())]
     if isinstance(value, Matrix):
-        return [
-            [_element_data(value[i, j]) for j in range(value.ncols())]
-            for i in range(value.nrows())
-        ]
+        return [[_element_data(value[i, j]) for j in range(value.ncols())] for i in range(value.nrows())]
     raise JuliaProtocolError(f"cannot encode element data for {value!r}")
 
 
@@ -421,7 +385,7 @@ _ELEMENT_TYPE_BY_KIND = {
 }
 
 
-def _element_kind(value: object) -> str | None:
+def _element_kind(value: Any) -> str | None:
     if isinstance(value, FinitePolyExtElement):
         return "gf"
     if isinstance(value, IntegerMod_abstract):
@@ -451,7 +415,7 @@ _PARENT_CLASSES = (
 )
 
 
-def encode_mrdi(value: object) -> dict | None:
+def encode_mrdi(value: Any) -> dict[str, Any] | None:
     """Encode a supported Sage value; None means outside the subset."""
     if value is ZZ or value is QQ or isinstance(value, _PARENT_CLASSES):
         refs: dict = {}
@@ -462,7 +426,7 @@ def encode_mrdi(value: object) -> dict | None:
         # keeping its deterministic UUID as the top-level "id": Oscar seeds
         # its deserializer registry from that id, so elements sent in later
         # payloads (whose _refs carry the same UUID) share this parent.
-        doc = {"_ns": {"Oscar": [OSCAR_NS_URL, OSCAR_NS_VERSION]}}
+        doc: dict[str, Any] = {"_ns": {"Oscar": [OSCAR_NS_URL, OSCAR_NS_VERSION]}}
         if isinstance(params, str):
             spec = refs.pop(params)
             doc["id"] = params
