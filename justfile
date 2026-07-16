@@ -44,7 +44,21 @@ test-ci: test
     just test
 
 # Full bootstrap: Python package into Sage + Julia deps/artifacts + Oscar verification.
-setup: install julia-deps
+setup: preflight install julia-deps
+
+# Assert required base toolchains are on PATH; fail loudly if any is missing.
+preflight:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    missing=()
+    for tool in sage julia uv; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if [ "${#missing[@]}" -ne 0 ]; then
+        echo "preflight failed: not on PATH: ${missing[*]}" >&2
+        exit 1
+    fi
+    echo "preflight ok: sage julia uv"
 
 # Install the bridge into Sage's Python environment.
 install:
