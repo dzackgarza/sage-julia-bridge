@@ -11,6 +11,7 @@ import atexit
 import base64
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ from sage.rings.rational_field import QQ
 from sage.structure.element import Matrix, Vector
 
 type StructuredValue = dict[str, object]
+
+_JULIA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
 
 
 class JuliaError(RuntimeError):
@@ -48,6 +51,35 @@ class BridgeResponse(BaseModel):
     stderr: str
 
 
+class JuliaHandle:
+    """Opaque reference to a Julia value held in the worker process.
+
+    Returned by sage()/call() for values the structured codec does not cover.
+    Handles are valid as set()/call() inputs; sage() attempts explicit
+    materialization and raises TypeError if the value is still uncovered.
+    """
+
+    def __init__(
+        self, bridge: Julia, handle_id: int, julia_type: str, display: str
+    ) -> None:
+        self._bridge = bridge
+        self._id = handle_id
+        self._julia_type = julia_type
+        self._display = display
+
+    def __repr__(self) -> str:
+        return f"JuliaHandle<{self._julia_type}>({self._display})"
+
+    def sage(self) -> object:
+        response = self._bridge._request("materialize", str(self._id))
+        return self._bridge._decode_value(response.structured, response.display)
+
+    def __del__(self) -> None:
+        # Only enqueue: sending a request here could interleave with an
+        # in-flight request on the same pipe (GC runs at arbitrary points).
+        self._bridge._pending_releases.append(self._id)
+
+
 class Julia:
     """Minimal Julia bridge suitable for use from Sage."""
 
@@ -58,6 +90,7 @@ class Julia:
         self._lock = threading.RLock()
         self._stderr: deque[str] = deque(maxlen=200)
         self._stderr_thread: threading.Thread | None = None
+        self._pending_releases: deque[int] = deque()
 
     def __repr__(self) -> str:
         return "Julia"
@@ -108,6 +141,8 @@ class Julia:
             str(self._bridge),
         ]
         self._stderr.clear()
+        # Handle ids die with the worker process they belong to.
+        self._pending_releases.clear()
         self._proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -132,6 +167,9 @@ class Julia:
     def _request(self, op: str, payload: str) -> BridgeResponse:
         with self._lock:
             self._ensure_process()
+            while self._pending_releases:
+                handle_id = self._pending_releases.popleft()
+                self._request_unlocked("release", str(handle_id))
             return self._request_unlocked(op, payload)
 
     def _request_unlocked(self, op: str, payload: str) -> BridgeResponse:
@@ -182,11 +220,15 @@ class Julia:
         parts = [chunk.rstrip() for chunk in (stdout, stderr, display) if chunk.strip()]
         return "\n".join(parts)
 
-    def _to_julia_literal(self, value: object) -> str:
+    def _encode_value(self, value: object) -> StructuredValue:
+        if value is None:
+            return {"type": "nothing"}
         if isinstance(value, bool):
-            return "true" if value else "false"
+            return {"type": "bool", "value": value}
+        if isinstance(value, str):
+            return {"type": "string", "value": value}
         if isinstance(value, Integral):
-            return str(int(value))
+            return {"type": "int", "value": str(int(value))}
         if isinstance(value, Rational):
             numerator = value.numerator
             denominator = value.denominator
@@ -194,28 +236,36 @@ class Julia:
                 numerator = numerator()
             if callable(denominator):
                 denominator = denominator()
-            return f"{int(numerator)}//{int(denominator)}"
-        if isinstance(value, Vector):
-            return (
-                "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
-            )
+            return {
+                "type": "rational",
+                "num": str(int(numerator)),
+                "den": str(int(denominator)),
+            }
+        if isinstance(value, JuliaHandle):
+            assert value._bridge is self, "handle belongs to a different Julia bridge"
+            return {"type": "handle", "id": value._id}
+        if isinstance(value, (Vector, list, tuple)):
+            return {
+                "type": "vector",
+                "data": [self._encode_value(entry) for entry in value],
+            }
         if isinstance(value, Matrix):
-            rows: list[str] = []
-            for i in range(value.nrows()):
-                row = " ".join(
-                    self._to_julia_literal(value[i, j]) for j in range(value.ncols())
-                )
-                rows.append(row)
-            return "[" + "; ".join(rows) + "]"
-        if isinstance(value, list):
-            return (
-                "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
-            )
-        if isinstance(value, tuple):
-            return (
-                "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
-            )
-        raise TypeError(f"unsupported Julia bridge input type: {type(value).__name__}")
+            entries = [
+                self._encode_value(value[i, j])
+                for i in range(value.nrows())
+                for j in range(value.ncols())
+            ]
+            return {
+                "type": "matrix",
+                "nrows": value.nrows(),
+                "ncols": value.ncols(),
+                "data": entries,
+            }
+        msg = (
+            f"unsupported Julia bridge input type: {type(value).__name__}; "
+            "use eval(...) with Julia source for values outside the structured codec"
+        )
+        raise TypeError(msg)
 
     def _decode_value(self, payload: str | StructuredValue, display: str) -> object:
         data = json.loads(payload) if isinstance(payload, str) else payload
@@ -235,6 +285,8 @@ class Julia:
         if kind == "matrix":
             entries = [self._decode_value(item, display) for item in data["data"]]
             return matrix(data["nrows"], data["ncols"], entries)
+        if kind == "handle":
+            return JuliaHandle(self, data["id"], data["julia_type"], data["display"])
         if kind == "unsupported":
             julia_type = data["julia_type"]
             msg = (
@@ -249,14 +301,16 @@ class Julia:
         return self._merge_text(response.display, response.stdout, response.stderr)
 
     def sage(self, code: str) -> object:
-        response = self._request("exec", code)
+        response = self._request("value", code)
         return self._decode_value(response.structured, response.display)
 
     def __call__(self, code: str) -> object:
         return self.sage(code)
 
     def set(self, var: str, value: object) -> None:
-        self.eval(f"{var} = {self._to_julia_literal(value)}")
+        assert _JULIA_IDENTIFIER.fullmatch(var), f"invalid Julia variable name: {var!r}"
+        payload = json.dumps({"name": var, "value": self._encode_value(value)})
+        self._request("set", payload)
 
     def get(self, var: str) -> str:
         return self.eval(var)
@@ -265,11 +319,17 @@ class Julia:
         return self.sage(var)
 
     def call(self, function: str, *args: object, **kwds: object) -> object:
-        arguments = [self._to_julia_literal(arg) for arg in args]
-        arguments.extend(
-            f"{key}={self._to_julia_literal(value)}" for key, value in kwds.items()
+        payload = json.dumps(
+            {
+                "function": function,
+                "args": [self._encode_value(arg) for arg in args],
+                "kwargs": {
+                    key: self._encode_value(value) for key, value in kwds.items()
+                },
+            }
         )
-        return self.sage(f"{function}({', '.join(arguments)})")
+        response = self._request("call", payload)
+        return self._decode_value(response.structured, response.display)
 
     def version(self) -> str:
         return self.eval("VERSION")

@@ -1,4 +1,5 @@
 using Base64
+import JSON
 
 function json_escape(s::AbstractString)
     io = IOBuffer()
@@ -88,12 +89,75 @@ function encode_supported(x)
     return nothing
 end
 
-function encode_value(x)
+# Opaque references to worker-held values the structured codec does not
+# cover. Keyed by a monotone id; entries live until the client releases them.
+const HANDLES = Dict{Int,Any}()
+const HANDLE_COUNTER = Ref(0)
+
+function register_handle(x)
+    id = (HANDLE_COUNTER[] += 1)
+    HANDLES[id] = x
+    return id
+end
+
+# wrap=true: uncovered values become handles (sage()/call() results).
+# wrap=false: uncovered values report unsupported (explicit materialization).
+function encode_value(x, wrap::Bool)
     encoded = encode_supported(x)
-    if encoded === nothing
+    encoded === nothing || return encoded
+    if !wrap
         return "{\"type\":\"unsupported\",\"julia_type\":" * json_string(string(typeof(x))) * "}"
     end
-    return encoded
+    id = register_handle(x)
+    return (
+        "{\"type\":\"handle\",\"id\":" * string(id) *
+        ",\"julia_type\":" * json_string(string(typeof(x))) *
+        ",\"display\":" * json_string(display_text(x)) * "}"
+    )
+end
+
+function decode_value(node::AbstractDict)
+    kind = node["type"]::String
+    if kind == "nothing"
+        return nothing
+    elseif kind == "bool"
+        return node["value"]::Bool
+    elseif kind == "string"
+        return String(node["value"]::String)
+    elseif kind == "int"
+        big = parse(BigInt, node["value"]::String)
+        return typemin(Int) <= big <= typemax(Int) ? Int(big) : big
+    elseif kind == "rational"
+        num = parse(BigInt, node["num"]::String)
+        den = parse(BigInt, node["den"]::String)
+        return Rational{BigInt}(num, den)
+    elseif kind == "vector"
+        return [decode_value(item) for item in node["data"]]
+    elseif kind == "matrix"
+        nrows = node["nrows"]::Int
+        ncols = node["ncols"]::Int
+        data = node["data"]
+        length(data) == nrows * ncols ||
+            error("matrix payload has ", length(data), " entries for ", nrows, "x", ncols)
+        return [decode_value(data[(i - 1) * ncols + j]) for i in 1:nrows, j in 1:ncols]
+    elseif kind == "handle"
+        id = node["id"]::Int
+        haskey(HANDLES, id) || error("unknown handle id: ", id)
+        return HANDLES[id]
+    end
+    error("unknown bridge value type: ", kind)
+end
+
+# Values are never interpolated into source: a function path is resolved as a
+# chain of symbol lookups, which cannot execute code.
+function resolve_path(path::AbstractString)
+    parts = split(path, '.')
+    all(!isempty, parts) || error("invalid function path: ", path)
+    obj = Main
+    for part in parts
+        obj = getproperty(obj, Symbol(part))
+    end
+    return obj
 end
 
 function b64(s::AbstractString)
@@ -109,13 +173,15 @@ function display_text(value)
     end
 end
 
-function evaluate(code::AbstractString)
+# The protocol runs over this process's stdout, so anything user code prints
+# must be captured or it corrupts the framing.
+function capture(f)
     stdout_pipe = Pipe()
     stderr_pipe = Pipe()
     value = nothing
     redirect_stdio(stdout=stdout_pipe, stderr=stderr_pipe) do
         try
-            value = Base.include_string(Main, code, "sage_julia_bridge")
+            value = f()
         finally
             close(stdout_pipe.in)
             close(stderr_pipe.in)
@@ -128,36 +194,78 @@ function evaluate(code::AbstractString)
     )
 end
 
+function evaluate(code::AbstractString)
+    return capture(() -> Base.include_string(Main, code, "sage_julia_bridge"))
+end
+
 function reply(parts::Vector{String})
     println(stdout, join(parts, '\t'))
     flush(stdout)
 end
 
+const NOTHING_NODE = "{\"type\":\"nothing\"}"
+
+# Returns (display, structured, stdout, stderr) for the ok reply.
+function handle_request(op::String, payload::String)
+    if op == "exec"
+        value, stdout_text, stderr_text = evaluate(payload)
+        return (display_text(value), NOTHING_NODE, stdout_text, stderr_text)
+    elseif op == "value"
+        value, stdout_text, stderr_text = evaluate(payload)
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "set"
+        request = JSON.parse(payload)
+        name = Symbol(request["name"]::String)
+        value = decode_value(request["value"])
+        # One eval creating binding and assignment together: a two-step
+        # declare-then-setglobal! fails because the new binding is not
+        # visible in this function's world age. QuoteNode keeps the value
+        # verbatim data; it is never parsed or evaluated as code.
+        Core.eval(Main, Expr(:(=), name, QuoteNode(value)))
+        return ("", NOTHING_NODE, "", "")
+    elseif op == "call"
+        request = JSON.parse(payload)
+        f = resolve_path(request["function"]::String)
+        args = Any[decode_value(item) for item in request["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
+        value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "materialize"
+        id = parse(Int, payload)
+        haskey(HANDLES, id) || error("unknown handle id: ", id)
+        x = HANDLES[id]
+        return (display_text(x), encode_value(x, false), "", "")
+    elseif op == "release"
+        id = parse(Int, payload)
+        haskey(HANDLES, id) || error("unknown handle id: ", id)
+        delete!(HANDLES, id)
+        return ("", NOTHING_NODE, "", "")
+    end
+    error("unknown bridge operation: ", op)
+end
+
 for line in eachline(stdin)
     isempty(line) && continue
     pieces = split(line, '\t'; limit=2)
-    op = pieces[1]
+    op = String(pieces[1])
     payload = length(pieces) == 2 ? String(base64decode(pieces[2])) : ""
     if op == "quit"
-        reply(["ok", b64(""), b64("{\"type\":\"nothing\"}"), b64(""), b64("")])
+        reply(["ok", b64(""), b64(NOTHING_NODE), b64(""), b64("")])
         break
     elseif op == "ping"
         reply(["ok", b64("pong"), b64("{\"type\":\"string\",\"value\":\"pong\"}"), b64(""), b64("")])
         continue
-    elseif op != "exec"
-        reply(["err", b64("unknown bridge operation: " * op), b64(""), b64("")])
-        continue
     end
 
     try
-        value, stdout_text, stderr_text = evaluate(payload)
         # invokelatest: the loop body runs in the world age of script load,
         # so methods and global bindings introduced by evaluated code (e.g.
         # `using Oscar`) are invisible to direct calls from here.
+        display, structured, stdout_text, stderr_text = Base.invokelatest(handle_request, op, payload)
         reply([
             "ok",
-            b64(Base.invokelatest(display_text, value)),
-            b64(Base.invokelatest(encode_value, value)),
+            b64(display),
+            b64(structured),
             b64(stdout_text),
             b64(stderr_text),
         ])
