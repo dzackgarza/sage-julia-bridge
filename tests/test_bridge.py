@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 _module = import_module("sage_julia_bridge")
 Julia = _module.Julia
 JuliaError = _module.JuliaError
+JuliaHandle = _module.JuliaHandle
 JuliaProtocolError = _module.JuliaProtocolError
 
 
@@ -327,6 +328,116 @@ end"""
         self.assertEqual(self.bridge.eval(oscar_code), "x^2 + y^2")
 
 
+class ProtocolTest(unittest.TestCase):
+    """set/call as protocol operations with structured values (issue #1, M2).
+
+    Values travel as data, never as interpolated Julia source; values the
+    codec does not cover come back as opaque JuliaHandle references.
+    """
+
+    bridge: Julia
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = Julia()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.quit()
+
+    def test_set_string_roundtrip(self) -> None:
+        self.bridge.set("s", "hello world")
+        self.assertEqual(self.bridge.get_sage("s"), "hello world")
+
+    def test_set_string_with_julia_syntax_is_data(self) -> None:
+        hostile = 'x"); global pwned = 1; error("boom"); ("\n\t;'
+        self.bridge.set("s", hostile)
+        self.assertEqual(self.bridge.get_sage("s"), hostile)
+        self.assertEqual(self.bridge.eval("isdefined(Main, :pwned)"), "false")
+
+    def test_set_none(self) -> None:
+        self.bridge.set("n", None)
+        self.assertIsNone(self.bridge.get_sage("n"))
+
+    def test_call_with_string_args(self) -> None:
+        self.bridge.eval('shout(s) = s * "!"')
+        self.assertEqual(self.bridge.call("shout", "abc"), "abc!")
+
+    def test_call_with_kwargs(self) -> None:
+        self.bridge.eval("addk(x; delta=0) = x + delta")
+        self.assertEqual(self.bridge.call("addk", ZZ(3), delta=ZZ(4)), ZZ(7))
+
+    def test_call_dotted_path(self) -> None:
+        self.assertEqual(self.bridge.call("Base.abs", ZZ(-5)), ZZ(5))
+
+    def test_call_path_is_not_executed(self) -> None:
+        with self.assertRaises(JuliaError):
+            self.bridge.call('begin global pwned2 = 1; abs end', ZZ(1))
+        self.assertEqual(self.bridge.eval("isdefined(Main, :pwned2)"), "false")
+
+    def test_unsupported_value_returns_handle(self) -> None:
+        result = self.bridge.sage("x -> x + 1")
+        self.assertIsInstance(result, JuliaHandle)
+
+    def test_handle_materialize_unsupported_raises(self) -> None:
+        handle = self.bridge.sage("x -> x + 1")
+        with self.assertRaises(TypeError):
+            handle.sage()
+
+    def test_handle_as_call_argument(self) -> None:
+        double = self.bridge.sage("x -> 2 * x")
+        result = self.bridge.call("map", double, [ZZ(1), ZZ(2), ZZ(3)])
+        self.assertEqual(result, vector(ZZ, [2, 4, 6]))
+
+    def test_set_handle(self) -> None:
+        double = self.bridge.sage("x -> 2 * x")
+        self.bridge.set("fn", double)
+        self.assertEqual(self.bridge.eval("fn(3)"), "6")
+
+    def test_handle_release_on_gc(self) -> None:
+        import gc
+
+        with Julia() as bridge:
+            handle = bridge.sage("x -> x")
+            self.assertEqual(bridge.eval("length(HANDLES)"), "1")
+            del handle
+            gc.collect()
+            self.assertEqual(bridge.eval("length(HANDLES)"), "0")
+
+    def test_stale_handle_rejected_after_restart(self) -> None:
+        # Ids restart from 1 with a new worker; a handle from a previous
+        # worker must fail loudly, never silently alias a new object
+        # (PR #3 review).
+        import gc
+
+        with Julia() as bridge:
+            stale = bridge.sage("x -> 10 * x")
+            bridge.quit()
+            fresh = bridge.sage("x -> 2 * x")  # restarts worker, id 1 again
+            with self.assertRaises(AssertionError):
+                bridge.call("map", stale, [ZZ(1), ZZ(2)])
+            with self.assertRaises(AssertionError):
+                stale.sage()
+            # A stale handle's GC must not release the new worker's entry.
+            del stale
+            gc.collect()
+            self.assertEqual(bridge.eval("length(HANDLES)"), "1")
+            result = bridge.call("map", fresh, [ZZ(1), ZZ(2)])
+            self.assertEqual(result, vector(ZZ, [2, 4]))
+
+    def test_float_input_rejected(self) -> None:
+        with self.assertRaises(TypeError) as ctx:
+            self.bridge.set("f", 1.5)
+        self.assertIn("float", str(ctx.exception))
+        self.assertIn("eval(", str(ctx.exception))
+
+    def test_dict_input_rejected(self) -> None:
+        with self.assertRaises(TypeError) as ctx:
+            self.bridge.set("d", {"a": 1})
+        self.assertIn("dict", str(ctx.exception))
+        self.assertIn("eval(", str(ctx.exception))
+
+
 class OscarCoercionTest(unittest.TestCase):
     """Structured sage() coercion of Oscar/Nemo values (issue #1, milestone M1).
 
@@ -387,6 +498,16 @@ class OscarCoercionTest(unittest.TestCase):
     def test_vector_of_qq_elements(self) -> None:
         result = self.bridge.sage("[QQ(1,2), QQ(3,4)]")
         self.assertEqual(result, vector(QQ, [QQ(1) / QQ(2), QQ(3) / QQ(4)]))
+
+    def test_handle_roundtrip_through_oscar(self) -> None:
+        # An Oscar ring is codec-uncovered -> handle; using it as a call
+        # argument and coercing the ZZMatrix result back closes the loop.
+        zz_ring = self.bridge.sage("ZZ")
+        self.assertIsInstance(zz_ring, JuliaHandle)
+        m = matrix(ZZ, [[1, 2], [3, 4]])
+        result = self.bridge.call("matrix", zz_ring, m)
+        self.assertEqual(result, m)
+        self.assertIs(result.base_ring(), ZZ)
 
     def test_qualified_import_oscar(self) -> None:
         # `import Oscar` binds only Main.Oscar — Nemo must be resolved from

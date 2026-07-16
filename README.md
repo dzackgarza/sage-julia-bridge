@@ -11,7 +11,7 @@ The bridge is intentionally small:
 - convert a small set of common values between Julia and Sage
 - let Sage load Julia packages such as Oscar out of process
 
-Supported structured conversions:
+Supported structured conversions (both directions):
 
 - integers
 - rationals
@@ -19,9 +19,16 @@ Supported structured conversions:
 - matrices
 - strings
 - booleans
+- `None` / `nothing`
+- Oscar/Nemo integers, rationals, and matrices over ZZ/QQ (converted exactly)
 
-Everything else is still evaluable, but `sage(...)` will refuse to coerce the
-result and `eval(...)` will return Julia's textual output.
+`set(...)` and `call(...)` are protocol operations: values travel as data and
+are never interpolated into Julia source. Any result outside the conversions
+above comes back from `sage(...)`/`call(...)` as an opaque `JuliaHandle`,
+which can be passed back into `set`/`call` and materialized explicitly with
+`.sage()` (raising `TypeError` if still unsupported). Inputs outside the
+codec (e.g. floats, dicts) are rejected loudly; use `eval(...)` with Julia
+source for anything else.
 
 ## Install
 
