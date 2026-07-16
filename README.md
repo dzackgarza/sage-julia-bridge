@@ -1,43 +1,41 @@
 # sage-julia-bridge
 
-`sage-julia-bridge` is a standalone Python package for Sage that talks to a
-long-lived Julia subprocess over stdio. It does not patch or modify Sage's
-source tree.
+`sage-julia-bridge` is a standalone Python package for Sage that talks to a long-lived Julia subprocess over stdio.
+It does not patch or modify Sage's source tree.
 
 The bridge is intentionally small:
 
 - evaluate Julia code as strings
+
 - keep one Julia session alive
+
 - convert a small set of common values between Julia and Sage
+
 - let Sage load Julia packages such as Oscar out of process
 
-Supported structured conversions (both directions, parent-aware — see
-`docs/wire-format.md` for the pinned grammar):
+Supported structured conversions (both directions, parent-aware — see `docs/wire-format.md` for the pinned grammar):
 
 - integers, rationals, strings, booleans, `None` / `nothing`
+
 - lists/tuples (containers stay containers)
+
 - `Zmod(n)`, `GF(p)`, and `GF(p^n)` with its explicit defining modulus
-- univariate and multivariate polynomial rings over the supported bases
-  (multivariate rings are identified with degrevlex order; other Sage term
-  orders are rejected on input)
+
+- univariate and multivariate polynomial rings over the supported bases (multivariate rings are identified with degrevlex order; other Sage term orders are rejected on input)
+
 - matrices over every supported base ring, including zero matrices
+
 - the parent rings themselves (e.g. passing Sage `ZZ` or `GF(7)` to `call`)
 
-Elements decoded from one Julia session share reconstructed parents, so
-arithmetic between round-tripped values works on both sides.
+Elements decoded from one Julia session share reconstructed parents, so arithmetic between round-tripped values works on both sides.
 
-`set(...)` and `call(...)` are protocol operations: values travel as data and
-are never interpolated into Julia source. Any result outside the conversions
-above comes back from `sage(...)`/`call(...)` as an opaque `JuliaHandle`,
-which can be passed back into `set`/`call` and materialized explicitly with
-`.sage()` (raising `TypeError` if still unsupported). Inputs outside the
-codec (e.g. floats, dicts) are rejected loudly; use `eval(...)` with Julia
-source for anything else.
+`set(...)` and `call(...)` are protocol operations: values travel as data and are never interpolated into Julia source.
+Any result outside the conversions above comes back from `sage(...)`/`call(...)` as an opaque `JuliaHandle`, which can be passed back into `set`/`call` and materialized explicitly with `.sage()` (raising `TypeError` if still unsupported).
+Inputs outside the codec (e.g. floats, dicts) are rejected loudly; use `eval(...)` with Julia source for anything else.
 
 ## Install
 
-Bootstrap everything (Python package into Sage, plus Julia dependencies and
-artifacts including Oscar):
+Bootstrap everything (Python package into Sage, plus Julia dependencies and artifacts including Oscar):
 
 ```bash
 just setup

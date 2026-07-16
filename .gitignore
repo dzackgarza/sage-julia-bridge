@@ -13,3 +13,4 @@ codeql-db/
 codeql-report.sarif
 models/
 src/sage_julia_bridge/julia_env/Manifest.toml
+*.sage.py
