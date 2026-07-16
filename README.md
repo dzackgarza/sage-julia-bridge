@@ -66,7 +66,5 @@ All project commands go through `just`:
 ```bash
 just install
 just test
-just lint
-just fmt
 just build
 ```

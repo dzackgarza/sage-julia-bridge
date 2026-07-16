@@ -1,4 +1,5 @@
 .coverage
+coverage.xml
 .pytest_cache/
 .ruff_cache/
 .venv/
@@ -8,3 +9,6 @@ dist/
 src/*.egg-info/
 src/**/*.egg-info/
 *.pyc
+codeql-db/
+codeql-report.sarif
+models/

@@ -80,9 +80,11 @@ class Julia:
         command = shutil.which("julia")
         if command:
             return command
-        raise JuliaError(
-            "Julia executable not found; set SAGE_JULIA_COMMAND or install Julia via juliaup"
+        msg = (
+            "Julia executable not found; "
+            "set SAGE_JULIA_COMMAND or install Julia via juliaup"
         )
+        raise JuliaError(msg)
 
     def _command_argv(self) -> list[str]:
         return shlex.split(self._command)
@@ -194,17 +196,25 @@ class Julia:
                 denominator = denominator()
             return f"{int(numerator)}//{int(denominator)}"
         if isinstance(value, Vector):
-            return "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
+            return (
+                "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
+            )
         if isinstance(value, Matrix):
             rows: list[str] = []
             for i in range(value.nrows()):
-                row = " ".join(self._to_julia_literal(value[i, j]) for j in range(value.ncols()))
+                row = " ".join(
+                    self._to_julia_literal(value[i, j]) for j in range(value.ncols())
+                )
                 rows.append(row)
             return "[" + "; ".join(rows) + "]"
         if isinstance(value, list):
-            return "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
+            return (
+                "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
+            )
         if isinstance(value, tuple):
-            return "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
+            return (
+                "[" + ", ".join(self._to_julia_literal(entry) for entry in value) + "]"
+            )
         raise TypeError(f"unsupported Julia bridge input type: {type(value).__name__}")
 
     def _decode_value(self, payload: str | StructuredValue, display: str) -> object:
@@ -227,10 +237,11 @@ class Julia:
             return matrix(data["nrows"], data["ncols"], entries)
         if kind == "unsupported":
             julia_type = data["julia_type"]
-            raise TypeError(
-                f"cannot convert Julia value of type {julia_type} to Sage; use eval(...) instead\n"
-                f"{display}"
+            msg = (
+                f"cannot convert Julia value of type {julia_type} to Sage; "
+                f"use eval(...) instead\n{display}"
             )
+            raise TypeError(msg)
         raise JuliaProtocolError(f"unknown Julia value type: {kind!r}")
 
     def eval(self, code: str) -> str:
@@ -255,7 +266,9 @@ class Julia:
 
     def call(self, function: str, *args: object, **kwds: object) -> object:
         arguments = [self._to_julia_literal(arg) for arg in args]
-        arguments.extend(f"{key}={self._to_julia_literal(value)}" for key, value in kwds.items())
+        arguments.extend(
+            f"{key}={self._to_julia_literal(value)}" for key, value in kwds.items()
+        )
         return self.sage(f"{function}({', '.join(arguments)})")
 
     def version(self) -> str:
