@@ -522,25 +522,30 @@ class Julia:
 
     def quit(self) -> None:
         with self._lock:
-            if self._proc is None:
+            proc = self._proc
+            if proc is None:
                 return
             try:
-                if self._proc.poll() is None:
+                if proc.poll() is None:
                     try:
                         self._request_unlocked("quit", "")
-                        self._proc.wait(timeout=2)
+                        proc.wait(timeout=2)
                     except Exception:
-                        try:
-                            self._proc.terminate()
-                            self._proc.wait(timeout=2)
-                        except Exception:
-                            self._proc.kill()
-                            self._proc.wait(timeout=2)
+                        proc = self._proc
+                        if proc is not None and proc.poll() is None:
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=2)
+                            except Exception:
+                                proc.kill()
+                                proc.wait(timeout=2)
             finally:
-                for stream_name in ("stdin", "stdout", "stderr"):
-                    stream = getattr(self._proc, stream_name)
-                    if stream is not None:
-                        self._close_worker_stream(stream)
+                proc = self._proc
+                if proc is not None:
+                    for stream_name in ("stdin", "stdout", "stderr"):
+                        stream = getattr(proc, stream_name)
+                        if stream is not None:
+                            self._close_worker_stream(stream)
                 self._proc = None
                 self._stderr_thread = None
 

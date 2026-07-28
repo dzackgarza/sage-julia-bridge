@@ -193,7 +193,7 @@ function encode_value(x, wrap::Bool)
         values = String[encode_value(item, wrap) for item in x]
         return "{\"type\":\"vector\",\"data\":[" * join(values, ",") * "]}"
     elseif x isa AbstractMatrix
-        values = String[encode_value(x[i, j], wrap) for i in axes(x, 1), j in axes(x, 2)]
+        values = String[encode_value(x[i, j], wrap) for i in axes(x, 1) for j in axes(x, 2)]
         return (
             "{\"type\":\"matrix\",\"nrows\":" * string(size(x, 1)) *
             ",\"ncols\":" * string(size(x, 2)) *
