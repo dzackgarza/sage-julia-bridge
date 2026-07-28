@@ -6,30 +6,30 @@ Display text never establishes identity or conversion.
 
 ## Protocol framing
 
-One request occupies one line on the worker's stdin: `op \t base64(payload)`.
-Protocol version 1 negotiates capabilities with `hello` before ordinary requests.
+One request occupies one line on the worker's stdin: `op \t base64(payload)`. Protocol version 1 negotiates capabilities with `hello` before ordinary requests.
 Operations include `exec`, `value`, `resolve`, `set`, `call`, `call_object`, `object`, `batch`, `materialize`, `release`, `ping`, and `quit`.
 
-A successful reply is `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)`.
-An error reply is `err \t b64(json_error) \t b64(stdout) \t b64(stderr)`.
-The JSON error carries `kind`, Julia exception type, message, and backend stack.
+A successful reply is `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)`. An error reply is `err \t b64(json_error) \t b64(stdout) \t b64(stderr)`. The JSON error carries `kind`, Julia exception type, message, and backend stack.
 Protocol violations, conversion refusal, parent incompatibility, released objects, stale objects, backend dispatch, and worker death remain distinguishable.
 
 ## Retained-object runtime
 
 A `handle` node identifies one worker-owned Julia value.
-Its Sage proxy records the bridge session and worker generation, so a restarted worker cannot alias an old ID.
-Repeated references in nested results reuse one backend ID.
-Each live proxy contributes one retained reference.
+Its Sage proxy records the bridge session and worker generation, so a restarted worker cannot alias an old ID. Repeated references in nested results reuse one backend ID. Each live proxy contributes one retained reference.
 `release()` is public and idempotent; garbage collection queues automatic release under the request lock.
 
 Foreign objects support:
 
 - returned and global callables, closures, callable structs, and modules;
+
 - property access and legal mutation;
+
 - indexing, legal indexed mutation, containment, length, and iteration;
+
 - backend equality and identity;
+
 - type, display, applicability, and retained-reference introspection;
+
 - recursive native, foreign, and heterogeneous arguments and results.
 
 `resolve(path)` performs symbol lookup without source evaluation.
@@ -59,8 +59,7 @@ No parent is ever inferred from container entries — the `int`/`rational` entri
 ## mrdi subset
 
 The `mrdi` node is an explicit value-conversion mechanism, not an object-admission gate.
-It carries an Oscar serialization document (`_ns`/`_type`/`data`/`_refs`) pinned to `_ns = {"Oscar": [..., "1.7.1"]}`.
-The Sage decoder rejects other namespaces and versions.
+It carries an Oscar serialization document (`_ns`/`_type`/`data`/`_refs`) pinned to `_ns = {"Oscar": [..., "1.7.1"]}`. The Sage decoder rejects other namespaces and versions.
 The admissible `_type` names — everywhere in the document, including `_refs` — are exactly:
 
 ```
@@ -136,17 +135,20 @@ Julia results remain usable as retained objects; Sage inputs require a registere
 
 - Floats, balls, p-adics, series, symbolic expressions, embeddings, weighted or block orderings, groups, schemes, morphisms, and other unregistered values.
 
-Conversion refusal raises `JuliaConversionError`.
-It never releases or invalidates the foreign object.
+Conversion refusal raises `JuliaConversionError`. It never releases or invalidates the foreign object.
 
 ## Layer boundaries
 
 Dependencies point downward:
 
 1. Native Sage facades and optional domain adapters
+
 2. Sage–Oscar realization maps
+
 3. Explicit conversion registry and MRDI conversion
+
 4. Generic retained-object runtime
+
 5. Versioned subprocess transport
 
 The Python and Julia kernel files do not import domain facades or dispatch on Oscar domain types.
