@@ -648,6 +648,50 @@ class OscarCoercionTest(unittest.TestCase):
         self.bridge.set("pelem", R.gen() + 1)
         self.assertEqual(self.bridge.eval("parent(pelem) === Rring"), "true")
 
+    def test_localization_map_requires_exact_oscar_source_parent(self) -> None:
+        # The bridge preserves parent identity for Sage-originating parents,
+        # but it must not guess that an independently constructed Oscar ring
+        # is "the same" source parent for a retained Oscar map.
+        from sage.all import PolynomialRing
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+
+        self.bridge.eval(
+            """
+Rnative, (xnative, ynative) = polynomial_ring(QQ, [:x, :y])
+Pnative = ideal(Rnative, [xnative])
+Unative = complement_of_prime_ideal(Pnative, check=false)
+RLnative, iotanative = localization(Rnative, Unative)
+"""
+        )
+        self.bridge.set("native_probe_poly", x + y)
+        self.assertFalse(self.bridge.sage("parent(native_probe_poly) === Rnative"))
+        with self.assertRaises(JuliaError):
+            self.bridge.sage("iotanative(native_probe_poly)")
+
+        self.bridge.set("RfromSageProbe", R)
+        self.bridge.eval(
+            """
+xsageProbe, ysageProbe = gens(RfromSageProbe)
+PfromSageProbe = ideal(RfromSageProbe, [xsageProbe])
+UfromSageProbe = complement_of_prime_ideal(PfromSageProbe, check=false)
+RLfromSageProbe, iotafromSageProbe = localization(RfromSageProbe, UfromSageProbe)
+"""
+        )
+        self.bridge.set("sage_parent_probe_poly", x + y)
+        self.assertTrue(self.bridge.sage("parent(sage_parent_probe_poly) === RfromSageProbe"))
+        self.assertTrue(
+            self.bridge.sage(
+                """
+begin
+    value = iotafromSageProbe(sage_parent_probe_poly)
+    parent(value) === RLfromSageProbe && value == iotafromSageProbe(xsageProbe + ysageProbe)
+end
+"""
+            )
+        )
+
     def test_parent_objects_decode(self) -> None:
         from sage.all import GF
 
