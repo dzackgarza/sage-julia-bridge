@@ -344,6 +344,127 @@ class ProtocolTest(unittest.TestCase):
             self.bridge.set("d", {"a": 1})
 
 
+class Issue11KernelCutoverRedProof(unittest.TestCase):
+    """Production-boundary red proof for the issue #11 object-model cutover."""
+
+    bridge: Julia
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = Julia()
+        cls.bridge.eval(
+            """
+module Issue11FreshRuntime
+export Box, AffineCallable, box_value, same_object, explode_structured
+
+mutable struct Box
+    value::Int
+end
+
+struct AffineCallable
+    scale::Int
+    shift::Int
+end
+
+(f::AffineCallable)(x) = f.scale * x + f.shift
+Base.getindex(box::Box, i::Int) = box.value + i
+Base.iterate(box::Box, state=1) = state > 3 ? nothing : (box.value + state, state + 1)
+box_value(box::Box) = box.value
+same_object(left, right) = left === right
+explode_structured(::Box) = throw(DomainError(:issue11_box, "structured backend failure witness"))
+end
+using .Issue11FreshRuntime
+"""
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.quit()
+
+    def test_fresh_runtime_callable_object_is_directly_invokable(self) -> None:
+        callable_object = self.bridge.sage("AffineCallable(3, 5)")
+
+        self.assertEqual(callable_object(ZZ(4)), ZZ(17))
+
+    def test_fresh_runtime_type_supports_properties_indexing_iteration_and_mutation(self) -> None:
+        box = self.bridge.sage("Box(41)")
+
+        self.assertEqual(box.getproperty("value"), ZZ(41))
+        box.setproperty("value", ZZ(58))
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(58))
+        self.assertEqual(box[ZZ(2)], ZZ(60))
+        self.assertEqual(list(box), [ZZ(59), ZZ(60), ZZ(61)])
+
+    def test_nested_results_preserve_repeated_foreign_reference_identity(self) -> None:
+        graph = self.bridge.sage("begin shared = Box(7); Any[shared, [shared, 11], (shared, shared)] end")
+        first = graph[0]
+        nested = graph[1][0]
+        tuple_left, tuple_right = graph[2]
+
+        self.assertEqual(graph[1][1], ZZ(11))
+        self.assertEqual(first.identity_key(), nested.identity_key())
+        self.assertEqual(tuple_left.identity_key(), tuple_right.identity_key())
+        self.assertTrue(self.bridge.call("same_object", first, tuple_left))
+
+    def test_conversion_refusal_leaves_foreign_object_usable(self) -> None:
+        box = self.bridge.sage("Box(13)")
+
+        with self.assertRaises(TypeError):
+            box.sage()
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(13))
+
+    def test_backend_failures_are_structured_and_do_not_poison_worker(self) -> None:
+        box = self.bridge.sage("Box(23)")
+
+        with self.assertRaises(JuliaError) as raised:
+            self.bridge.call("explode_structured", box)
+        self.assertEqual(raised.exception.backend_type, "DomainError")
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(23))
+
+    def test_half_dead_worker_exit_restarts_and_stales_old_objects(self) -> None:
+        with Julia() as bridge:
+            bridge.eval(
+                """
+module Issue11RestartRuntime
+export Box
+
+mutable struct Box
+    value::Int
+end
+end
+using .Issue11RestartRuntime
+"""
+            )
+            old_pid = bridge.sage("getpid()")
+            stale = bridge.sage("Box(31)")
+            with self.assertRaises(JuliaError):
+                bridge.eval("exit(86)")
+            new_pid = bridge.sage("getpid()")
+
+            self.assertNotEqual(new_pid, old_pid)
+            with self.assertRaises(JuliaError) as raised:
+                stale.getproperty("value")
+            self.assertEqual(raised.exception.kind, "stale-object")
+            self.assertEqual(bridge.sage("1 + 1"), ZZ(2))
+
+    def test_prime_localization_returns_native_sage_facade_objects(self) -> None:
+        from sage.all import PolynomialRing
+        from sage_julia_bridge import prime_localization
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+        L, iota = prime_localization(R, R.ideal([x]))
+        local_element = iota(x + y)
+        residue_field, rho = L.residue_field()
+
+        self.assertIs(local_element.parent(), L)
+        self.assertFalse(local_element.is_unit())
+        self.assertTrue(iota(y).is_unit())
+        self.assertEqual(L.maximal_ideal(), R.ideal([x]).extension(L))
+        self.assertEqual(rho(local_element), residue_field.gen())
+        self.assertEqual(iota.oscar().domain().identity_key(), L.oscar().base_ring().identity_key())
+
+
 class MrdiCodecTest(unittest.TestCase):
     """Parent-aware structured transport via the mrdi subset (issue #1, M3).
 
