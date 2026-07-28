@@ -1,6 +1,23 @@
 using Base64
 import JSON
 
+const BRIDGE_PROTOCOL_VERSION = 1
+const BRIDGE_CAPABILITIES = [
+    "transport.structured-errors",
+    "runtime.retained-objects",
+    "runtime.call-object",
+    "runtime.properties",
+    "runtime.indexing",
+    "runtime.iteration",
+    "runtime.length",
+    "runtime.identity",
+    "runtime.equality",
+    "runtime.introspection",
+    "runtime.release",
+    "runtime.batch",
+    "conversion.mrdi",
+]
+
 function json_escape(s::AbstractString)
     io = IOBuffer()
     for c in s
@@ -427,9 +444,19 @@ end
 
 const NOTHING_NODE = "{\"type\":\"nothing\"}"
 
+function hello_payload()
+    return JSON.json(Dict(
+        "protocol_version" => BRIDGE_PROTOCOL_VERSION,
+        "capabilities" => BRIDGE_CAPABILITIES,
+    ))
+end
+
 # Returns (display, structured, stdout, stderr) for the ok reply.
 function handle_request(op::String, payload::String)
-    if op == "exec"
+    if op == "hello"
+        payload = hello_payload()
+        return (payload, "{\"type\":\"string\",\"value\":" * json_string(payload) * "}", "", "")
+    elseif op == "exec"
         value, stdout_text, stderr_text = evaluate(payload)
         return (display_text(value), NOTHING_NODE, stdout_text, stderr_text)
     elseif op == "value"

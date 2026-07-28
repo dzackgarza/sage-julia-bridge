@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -59,6 +60,14 @@ class JuliaBridgeTest(unittest.TestCase):
         major, minor = self.bridge.version().split(".")[:2]
         self.assertGreaterEqual(int(major), 1)
         self.assertGreaterEqual(int(minor), 0)
+
+    def test_protocol_negotiation_reports_version_and_capabilities(self) -> None:
+        capabilities = self.bridge.capabilities()
+
+        self.assertEqual(self.bridge.protocol_version(), 1)
+        self.assertIn("runtime.retained-objects", capabilities)
+        self.assertIn("runtime.batch", capabilities)
+        self.assertIn("transport.structured-errors", capabilities)
 
     def test_sage_call_alias(self) -> None:
         self.assertEqual(self.bridge("2 * 3"), ZZ(6))
@@ -160,7 +169,7 @@ class JuliaBridgeTest(unittest.TestCase):
 
     def test_protocol_violations_raise(self) -> None:
         # A real subprocess speaking broken protocol over real pipes: the
-        # shim answers the startup ping with each malformed frame class
+        # shim answers the startup hello with each malformed frame class
         # (short ok reply, short err reply, unknown status).
         import shlex
         import sys
@@ -188,15 +197,16 @@ class JuliaBridgeTest(unittest.TestCase):
         def b64(text: str) -> str:
             return base64.b64encode(text.encode()).decode()
 
-        nothing_node = b64('{"type":"nothing"}')
+        hello_text = '{"protocol_version":1,"capabilities":["runtime.retained-objects"]}'
+        hello_node = b64(json.dumps({"type": "string", "value": hello_text}))
         bogus_node = b64('{"type":"bogus"}')
-        ok_nothing = f"ok\t\t{nothing_node}\t\t"
+        ok_hello = f"ok\t{b64(hello_text)}\t{hello_node}\t\t"
         ok_bogus = f"ok\t\t{bogus_node}\t\t"
         with tempfile.TemporaryDirectory() as tmp:
             shim = Path(tmp) / "shim.py"
             shim.write_text(
                 "import sys\n"
-                "for reply in (" + repr(ok_nothing) + ", " + repr(ok_bogus) + "):\n"
+                "for reply in (" + repr(ok_hello) + ", " + repr(ok_bogus) + "):\n"
                 "    sys.stdin.readline()\n"
                 "    sys.stdout.write(reply + '\\n')\n"
                 "    sys.stdout.flush()\n"

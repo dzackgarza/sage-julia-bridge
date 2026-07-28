@@ -37,6 +37,7 @@ from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
 type StructuredValue = dict[str, Any]
 
 _JULIA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
+BRIDGE_PROTOCOL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,8 @@ class Julia:
         self._stderr_thread: threading.Thread | None = None
         self._pending_releases: deque[int] = deque()
         self._generation = 0
+        self._protocol_version: int | None = None
+        self._capabilities: frozenset[str] = frozenset()
         self.conversions = ConversionRegistry()
 
     def __repr__(self) -> str:
@@ -297,7 +300,22 @@ class Julia:
         )
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
-        self._request_unlocked("ping", "")
+        self._negotiate_protocol()
+
+    def _negotiate_protocol(self) -> None:
+        response = self._request_unlocked("hello", "")
+        try:
+            metadata_value = self._decode_value(response.structured, response.display)
+            if not isinstance(metadata_value, str):
+                raise TypeError(f"hello returned {type(metadata_value).__name__}")
+            metadata = json.loads(metadata_value)
+        except Exception as exc:
+            raise JuliaProtocolError("malformed Julia bridge hello response") from exc
+        version = int(metadata["protocol_version"])
+        if version != BRIDGE_PROTOCOL_VERSION:
+            raise JuliaProtocolError(f"unsupported Julia bridge protocol version: {version}")
+        self._protocol_version = version
+        self._capabilities = frozenset(str(capability) for capability in metadata["capabilities"])
 
     def _encode(self, value: str) -> str:
         return base64.b64encode(value.encode("utf-8")).decode("ascii")
@@ -560,6 +578,15 @@ class Julia:
 
     def version(self) -> str:
         return self.eval("VERSION")
+
+    def protocol_version(self) -> int:
+        self._ensure_process()
+        assert self._protocol_version is not None
+        return self._protocol_version
+
+    def capabilities(self) -> frozenset[str]:
+        self._ensure_process()
+        return self._capabilities
 
     def quit(self) -> None:
         with self._lock:
