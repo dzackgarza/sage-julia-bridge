@@ -468,6 +468,90 @@ using .Issue11RestartRuntime
         self.assertEqual(iota.oscar().domain().identity_key(), L.oscar().base_ring().identity_key())
 
 
+class Issue11GenericOscarSentinelTest(unittest.TestCase):
+    """Cross-domain proof that the core object runtime is not ring-shaped."""
+
+    bridge: Julia
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = Julia()
+        cls.bridge.eval("using Oscar")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.quit()
+
+    def test_free_module_element_composes_without_codec(self) -> None:
+        element, module, doubled, coordinates, exact_parent = self.bridge.sage(
+            """
+begin
+    M = free_module(QQ, 3)
+    e = M([QQ(1), QQ(2), QQ(3)])
+    (e, parent(e), e + e, coordinates(e), parent(e) === M)
+end
+"""
+        )
+
+        self.assertTrue(exact_parent)
+        self.assertEqual(coordinates, [ZZ(1), ZZ(2), ZZ(3)])
+        self.assertEqual(self.bridge.call("parent", element).identity_key(), module.identity_key())
+        self.assertEqual(self.bridge.call("coordinates", doubled), [ZZ(2), ZZ(4), ZZ(6)])
+
+    def test_matrix_algebra_element_composes_without_codec(self) -> None:
+        algebra, element, square, exact_parent = self.bridge.sage(
+            """
+begin
+    A = matrix_algebra(QQ, 2)
+    a = A(matrix(QQ, [1 2; 0 1]))
+    (A, a, a*a, parent(a) === A)
+end
+"""
+        )
+
+        self.assertTrue(exact_parent)
+        self.assertEqual(self.bridge.call("parent", element).identity_key(), algebra.identity_key())
+        self.assertNotEqual(square.identity_key(), element.identity_key())
+
+    def test_scheme_and_lattice_inspection_use_same_object_runtime(self) -> None:
+        scheme, coordinate_ring, dimension, lattice, gram, rank = self.bridge.sage(
+            """
+begin
+    R, (x, y) = polynomial_ring(QQ, [:x, :y])
+    X = spec(R)
+    L = quadratic_lattice(QQ; gram=matrix(QQ, [1 0; 0 -1]))
+    (X, coordinate_ring(X), dim(X), L, gram_matrix(L), rank(L))
+end
+"""
+        )
+
+        self.assertEqual(dimension, ZZ(2))
+        self.assertEqual(self.bridge.call("dim", scheme), ZZ(2))
+        self.assertEqual(self.bridge.call("coordinate_ring", scheme), coordinate_ring)
+        self.assertEqual(rank, ZZ(2))
+        self.assertEqual(gram, matrix(ZZ, [[1, 0], [0, -1]]))
+        self.assertEqual(self.bridge.call("gram_matrix", lattice), gram)
+
+    def test_group_and_heterogeneous_graph_preserve_identity(self) -> None:
+        module, element, repeated_module, group, generator, repeated_group, group_order = self.bridge.sage(
+            """
+begin
+    M = free_module(QQ, 2)
+    e = M([QQ(3), QQ(5)])
+    G = symmetric_group(4)
+    g = gens(G)[1]
+    (M, e, M, G, g, G, order(G))
+end
+"""
+        )
+
+        self.assertEqual(module.identity_key(), repeated_module.identity_key())
+        self.assertEqual(group.identity_key(), repeated_group.identity_key())
+        self.assertEqual(self.bridge.call("parent", element).identity_key(), module.identity_key())
+        self.assertEqual(self.bridge.call("parent", generator).identity_key(), group.identity_key())
+        self.assertEqual(group_order, ZZ(24))
+
+
 class MrdiCodecTest(unittest.TestCase):
     """Parent-aware structured transport via the mrdi subset (issue #1, M3).
 

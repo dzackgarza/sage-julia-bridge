@@ -40,10 +40,10 @@ json_string(s::AbstractString) = "\"" * json_escape(s) * "\""
 function nemo_to_base(x)
     Nemo = parentmodule(typeof(x))
     nameof(Nemo) === :Nemo || return nothing
-    x isa Nemo.ZZRingElem && return BigInt(x)
-    x isa Nemo.QQFieldElem && return Rational{BigInt}(x)
-    x isa Nemo.ZZMatrix && return Matrix{BigInt}(x)
-    x isa Nemo.QQMatrix && return Matrix{Rational{BigInt}}(x)
+    x isa Nemo.ZZRingElem && return Base.invokelatest(BigInt, x)
+    x isa Nemo.QQFieldElem && return Base.invokelatest(Rational{BigInt}, x)
+    x isa Nemo.ZZMatrix && return Base.invokelatest(Matrix{BigInt}, x)
+    x isa Nemo.QQMatrix && return Base.invokelatest(Matrix{Rational{BigInt}}, x)
     return nothing
 end
 
