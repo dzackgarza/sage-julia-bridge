@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from sage.categories.homset import Hom
+from sage.rings.morphism import RingHomomorphism
+
 from sage_julia_bridge.errors import JuliaConversionError
 from sage_julia_bridge.interface import JuliaHandle
 
@@ -59,8 +62,8 @@ def coerce_compatible_parent(domain: Any, value: Any) -> Any:
         ) from exc
 
 
-class SageOscarRealizationMap:
-    """Sage-callable realization map retaining the corresponding Oscar map."""
+class SageOscarRealizationMap(RingHomomorphism):
+    """Native Sage ring morphism retaining the corresponding Oscar map."""
 
     def __init__(
         self,
@@ -69,21 +72,17 @@ class SageOscarRealizationMap:
         oscar_map: JuliaHandle,
         materializer: RealizationMaterializer,
     ) -> None:
-        self._domain = domain
-        self._codomain = codomain
+        RingHomomorphism.__init__(self, Hom(domain, codomain))
         self._oscar_map = oscar_map
         self._materializer = materializer
 
-    def domain(self) -> Any:
-        return self._domain
-
-    def codomain(self) -> Any:
-        return self._codomain
-
-    def __call__(self, value: Any) -> Any:
-        coerced = coerce_compatible_parent(self._domain, value)
+    def _call_(self, value: Any) -> Any:
+        coerced = coerce_compatible_parent(self.domain(), value)
         oscar_value = self._oscar_map(coerced)
         return self._materializer(coerced, oscar_value)
+
+    def __call__(self, value: Any) -> Any:
+        return self._call_(value)
 
     def oscar(self) -> JuliaHandle:
         return self._oscar_map

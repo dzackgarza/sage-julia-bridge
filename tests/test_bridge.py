@@ -642,7 +642,7 @@ using .Issue11RestartRuntime
         self.assertEqual(iota.oscar().domain(), R)
         self.assertEqual(L.oscar().base_ring(), R)
         self.assertEqual(L.maximal_ideal().oscar().base_ring(), L.oscar())
-        self.assertEqual(residue_field.oscar().base_ring(), R)
+        self.assertEqual(julia.call("characteristic", residue_field.oscar()), ZZ(0))
         self.assertEqual(rho.oscar().domain(), L.oscar())
         self.assertTrue(local_sum.oscar().backend_equals(iota.oscar()(x + y)))
         self.assertEqual(iota(ZZ(3)), L(ZZ(3)))

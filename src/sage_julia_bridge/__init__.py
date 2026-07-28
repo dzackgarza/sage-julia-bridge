@@ -10,7 +10,7 @@ from sage_julia_bridge.interface import (
     batch_ref,
     julia,
 )
-from sage_julia_bridge.localization import prime_localization
+from sage_julia_bridge.localization import PrimeLocalRings, prime_localization
 from sage_julia_bridge.realization import SageOscarRealizationMap
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "JuliaError",
     "JuliaHandle",
     "JuliaProtocolError",
+    "PrimeLocalRings",
     "SageOscarRealizationMap",
     "batch_ref",
     "julia",

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from sage.categories.rings import Rings
-from sage.structure.element import Element
+from sage.categories.category_singleton import Category_singleton
+from sage.categories.fields import Fields
+from sage.categories.homset import Hom
+from sage.categories.integral_domains import IntegralDomains
+from sage.rings.ideal import Ideal_generic
+from sage.rings.morphism import RingHomomorphism
+from sage.structure.element import FieldElement, IntegralDomainElement
 from sage.structure.parent import Parent
 
 from sage_julia_bridge.errors import JuliaConversionError
@@ -13,7 +18,17 @@ from sage_julia_bridge.interface import JuliaHandle, julia
 from sage_julia_bridge.realization import SageOscarRealizationMap, coerce_compatible_parent
 
 
-class PrimeLocalizationElement(Element):
+class PrimeLocalRings(Category_singleton):
+    """Category of integral domains with one maximal ideal."""
+
+    def super_categories(self) -> list[Any]:
+        return [IntegralDomains()]
+
+    def _repr_object_names(self) -> str:
+        return "prime local rings"
+
+
+class PrimeLocalizationElement(IntegralDomainElement):
     """Element of a prime-local Sage facade backed by an Oscar object."""
 
     def __init__(
@@ -87,37 +102,40 @@ class PrimeLocalizationElement(Element):
         return self.parent() is other.parent() and self._fraction == other._fraction
 
 
-class PrimeLocalizationIdeal:
-    """Ideal of a prime-local Sage facade."""
+class PrimeLocalizationIdeal(Ideal_generic):
+    """Native Sage ideal retaining the corresponding Oscar localized ideal."""
 
     def __init__(self, ring: PrimeLocalizationParent, generators: list[Any]) -> None:
-        self._ring = ring
-        self._generators = tuple(ring(generator) for generator in generators)
-        self._base_ideal = ring._base.ideal([generator.numerator() for generator in self._generators])
+        from sage.all import ZZ
 
-    def ring(self) -> PrimeLocalizationParent:
-        return self._ring
+        Ideal_generic.__init__(self, ring, generators)
+        self._base_ideal = ring._base.ideal([generator.numerator() for generator in self.gens()])
+        constructor = "bridge_localized_ideal" if ring._base is ZZ else "ideal"
+        self._oscar = cast(
+            JuliaHandle,
+            julia.call(constructor, ring.oscar(), [generator.oscar() for generator in self.gens()]),
+        )
 
-    def gens(self) -> tuple[PrimeLocalizationElement, ...]:
-        return self._generators
+    def oscar(self) -> JuliaHandle:
+        return self._oscar
 
     def is_maximal(self) -> bool:
-        return self == self._ring.maximal_ideal()
+        return bool(self == self.ring().maximal_ideal())
 
     def quotient(self) -> Any:
-        return self._ring.quotient(self)
+        return self.ring().quotient(self)
 
-    def __contains__(self, value: Any) -> bool:
-        element = self._ring(value)
+    def _contains_(self, value: Any) -> bool:
+        element = self.ring()(value)
         if self.is_maximal():
-            return element.numerator() in self._ring._prime
+            return element.numerator() in self.ring()._prime
         return element.numerator() in self._base_ideal
 
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, PrimeLocalizationIdeal) and self._ring is other._ring and self._generators == other._generators
-
-    def _repr_(self) -> str:
-        return f"Ideal {self._generators} of {self._ring}"
+    def _richcmp_(self, other: Any, op: int) -> bool:
+        if not isinstance(other, PrimeLocalizationIdeal) or self.ring() is not other.ring():
+            return op == 3
+        equal = self._oscar.backend_equals(other._oscar)
+        return equal if op == 2 else not equal if op == 3 else False
 
 
 class PrimeLocalizationParent(Parent):
@@ -126,7 +144,7 @@ class PrimeLocalizationParent(Parent):
     Element = PrimeLocalizationElement
 
     def __init__(self, base: Any, prime: Any, oscar_ring: JuliaHandle, oscar_iota: JuliaHandle) -> None:
-        Parent.__init__(self, base=base, category=Rings())
+        Parent.__init__(self, base=base, category=PrimeLocalRings())
         self._base = base
         self._prime = prime
         self._oscar_ring = oscar_ring
@@ -134,6 +152,7 @@ class PrimeLocalizationParent(Parent):
         self._fraction_field = base.fraction_field()
         self._maximal_ideal = PrimeLocalizationIdeal(self, list(prime.gens()))
         self._residue_field_data: tuple[Any, PrimeLocalizationResidueMap] | None = None
+        self._populate_coercion_lists_()
 
     def _repr_(self) -> str:
         return f"{self._base} localized at {self._prime}"
@@ -197,8 +216,13 @@ class PrimeLocalizationParent(Parent):
         if self._residue_field_data is not None:
             return self._residue_field_data
         quotient = self._base.quotient(self._prime)
-        field = quotient.fraction_field()
-        self._residue_field_data = (field, PrimeLocalizationResidueMap(self, field, quotient))
+        native_field = quotient.fraction_field()
+        oscar_field, oscar_map = _oscar_residue_realization(self)
+        field = PrimeLocalizationResidueField(native_field, oscar_field)
+        self._residue_field_data = (
+            field,
+            PrimeLocalizationResidueMap(self, field, quotient, oscar_map),
+        )
         return self._residue_field_data
 
 
@@ -209,25 +233,141 @@ class PrimeLocalizationMap(SageOscarRealizationMap):
         super().__init__(domain, codomain, oscar_map, codomain._from_base_realization)
 
 
-class PrimeLocalizationResidueMap:
-    """Residue map from a prime localization to the fraction field of R/P."""
+class PrimeLocalizationResidueFieldElement(FieldElement):
+    """Element of the native residue-field facade."""
 
-    def __init__(self, domain: PrimeLocalizationParent, codomain: Any, quotient: Any) -> None:
-        self._domain = domain
-        self._codomain = codomain
+    def __init__(self, parent: PrimeLocalizationResidueField, value: Any) -> None:
+        FieldElement.__init__(self, parent)
+        self._value = parent._native(value)
+
+    def _repr_(self) -> str:
+        return repr(self._value)
+
+    def _add_(self, other: PrimeLocalizationResidueFieldElement) -> PrimeLocalizationResidueFieldElement:
+        return cast(PrimeLocalizationResidueFieldElement, self.parent()(self._value + other._value))
+
+    def _mul_(self, other: PrimeLocalizationResidueFieldElement) -> PrimeLocalizationResidueFieldElement:
+        return cast(PrimeLocalizationResidueFieldElement, self.parent()(self._value * other._value))
+
+    def _neg_(self) -> PrimeLocalizationResidueFieldElement:
+        return cast(PrimeLocalizationResidueFieldElement, self.parent()(-self._value))
+
+    def __invert__(self) -> PrimeLocalizationResidueFieldElement:
+        return cast(PrimeLocalizationResidueFieldElement, self.parent()(~self._value))
+
+    def _div_(
+        self,
+        other: PrimeLocalizationResidueFieldElement,
+    ) -> PrimeLocalizationResidueFieldElement:
+        return cast(PrimeLocalizationResidueFieldElement, self.parent()(self._value / other._value))
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, PrimeLocalizationResidueFieldElement) and self.parent() is other.parent() and self._value == other._value
+
+
+class PrimeLocalizationResidueField(Parent):
+    """Native Sage field parent retaining the Oscar residue-field realization."""
+
+    Element = PrimeLocalizationResidueFieldElement
+
+    def __init__(self, native: Any, oscar_field: JuliaHandle) -> None:
+        Parent.__init__(self, base=native.base_ring(), category=Fields())
+        self._native = native
+        self._oscar = oscar_field
+        self._populate_coercion_lists_()
+
+    def _repr_(self) -> str:
+        return repr(self._native)
+
+    def _element_constructor_(self, value: Any) -> PrimeLocalizationResidueFieldElement:
+        if isinstance(value, PrimeLocalizationResidueFieldElement):
+            if value.parent() is self:
+                return value
+            value = value._value
+        return PrimeLocalizationResidueFieldElement(self, value)
+
+    def oscar(self) -> JuliaHandle:
+        return self._oscar
+
+    def characteristic(self) -> Any:
+        return self._native.characteristic()
+
+    def is_finite(self) -> bool:
+        return bool(self._native.is_finite())
+
+    def order(self) -> Any:
+        return self._native.order()
+
+    def gen(self, index: int = 0) -> PrimeLocalizationResidueFieldElement:
+        return cast(PrimeLocalizationResidueFieldElement, self(self._native.gen(index)))
+
+    def gens(self) -> tuple[PrimeLocalizationResidueFieldElement, ...]:
+        return tuple(self(generator) for generator in self._native.gens())
+
+
+class PrimeLocalizationResidueMap(RingHomomorphism):
+    """Native Sage residue morphism retaining the Oscar residue map."""
+
+    def __init__(
+        self,
+        domain: PrimeLocalizationParent,
+        codomain: PrimeLocalizationResidueField,
+        quotient: Any,
+        oscar_map: JuliaHandle,
+    ) -> None:
+        RingHomomorphism.__init__(self, Hom(domain, codomain))
         self._quotient = quotient
+        self._oscar = oscar_map
 
-    def domain(self) -> PrimeLocalizationParent:
-        return self._domain
-
-    def codomain(self) -> Any:
-        return self._codomain
-
-    def __call__(self, value: Any) -> Any:
-        element = self._domain(value)
+    def _call_(self, value: Any) -> Any:
+        element = self.domain()(value)
         numerator = self._quotient(element.numerator())
         denominator = self._quotient(element.denominator())
-        return self._codomain(numerator) / self._codomain(denominator)
+        return self.codomain()(numerator) / self.codomain()(denominator)
+
+    def oscar(self) -> JuliaHandle:
+        return self._oscar
+
+    def kernel(self) -> PrimeLocalizationIdeal:
+        return cast(PrimeLocalizationIdeal, self.domain().maximal_ideal())
+
+    def is_surjective(self) -> bool:
+        return True
+
+
+def _oscar_residue_realization(
+    localization: PrimeLocalizationParent,
+) -> tuple[JuliaHandle, JuliaHandle]:
+    from sage.all import ZZ
+
+    if localization._base is ZZ:
+        oscar_field, base_residue_map = julia.call(
+            "residue_field",
+            localization._base,
+            localization._prime.gen(),
+        )
+        oscar_map = julia.call(
+            "bridge_fraction_residue_map",
+            localization.oscar(),
+            oscar_field,
+            base_residue_map,
+        )
+        return cast(JuliaHandle, oscar_field), cast(JuliaHandle, oscar_map)
+
+    oscar_prime = julia.call(
+        "ideal",
+        localization._base,
+        list(localization._prime.gens()),
+    )
+    quotient_ring, quotient_map = julia.call("quo", localization._base, oscar_prime)
+    oscar_field = julia.call("fraction_field", quotient_ring)
+    oscar_map = julia.call(
+        "bridge_fraction_residue_map",
+        localization.oscar(),
+        oscar_field,
+        quotient_map,
+    )
+    return cast(JuliaHandle, oscar_field), cast(JuliaHandle, oscar_map)
 
 
 def prime_localization(base: Any, prime: Any) -> tuple[PrimeLocalizationParent, PrimeLocalizationMap]:

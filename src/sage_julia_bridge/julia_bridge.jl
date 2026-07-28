@@ -1,6 +1,10 @@
 using Base64
 import JSON
 
+for adapter in filter(path -> endswith(path, "_backend.jl"), readdir(@__DIR__; join=true))
+    include(adapter)
+end
+
 const BRIDGE_PROTOCOL_VERSION = 1
 const BRIDGE_CAPABILITIES = [
     "transport.structured-errors",
