@@ -370,7 +370,7 @@ class Issue11KernelCutoverRedProof(unittest.TestCase):
         cls.bridge.eval(
             """
 module Issue11FreshRuntime
-export Box, IndexedBox, AffineCallable, box_value, same_object, explode_structured
+export Box, IndexedBox, AffineCallable, box_value, make_affine, same_object, explode_structured
 
 mutable struct Box
     value::Int
@@ -394,6 +394,7 @@ Base.setindex!(box::IndexedBox, value::Int, i::Int) = (box.values[i] = value; bo
 Base.iterate(box::IndexedBox, state=1) = state > length(box.values) ? nothing : (box.values[state], state + 1)
 Base.:(==)(left::IndexedBox, right::IndexedBox) = left.values == right.values
 box_value(box::Box) = box.value
+make_affine(scale, shift) = value -> scale * value + shift
 same_object(left, right) = left === right
 explode_structured(::Box) = throw(DomainError(:issue11_box, "structured backend failure witness"))
 end
@@ -406,9 +407,13 @@ using .Issue11FreshRuntime
         cls.bridge.quit()
 
     def test_fresh_runtime_callable_object_is_directly_invokable(self) -> None:
-        callable_object = self.bridge.sage("AffineCallable(3, 5)")
+        module = self.bridge.resolve("Issue11FreshRuntime")
+        constructor = module.getproperty("AffineCallable")
+        callable_object = constructor(ZZ(3), ZZ(5))
+        returned_closure = self.bridge.resolve("Issue11FreshRuntime.make_affine")(ZZ(4), ZZ(1))
 
         self.assertEqual(callable_object(ZZ(4)), ZZ(17))
+        self.assertEqual(returned_closure(ZZ(6)), ZZ(25))
 
     def test_fresh_runtime_type_supports_properties_indexing_iteration_and_mutation(self) -> None:
         box = self.bridge.sage("Box(41)")
@@ -424,6 +429,7 @@ using .Issue11FreshRuntime
 
         self.assertEqual(len(box), 3)
         self.assertEqual(box[ZZ(2)], ZZ(5))
+        self.assertTrue(ZZ(5) in box)
         box[ZZ(2)] = ZZ(41)
         self.assertEqual(list(box), [ZZ(4), ZZ(41), ZZ(6)])
         self.assertFalse(box.backend_equals(equal_box))
@@ -639,8 +645,7 @@ using .Issue11RestartRuntime
         self.assertEqual(L.maximal_ideal(), L.ideal([x]))
         self.assertEqual(rho(local_element), residue_field.zero())
         self.assertEqual(rho(iota(y)), residue_field.gen(1))
-        self.assertEqual(iota.oscar().domain(), R)
-        self.assertEqual(L.oscar().base_ring(), R)
+        self.assertTrue(iota.oscar().domain().backend_identical(L.oscar().base_ring()))
         self.assertEqual(L.maximal_ideal().oscar().base_ring(), L.oscar())
         self.assertEqual(julia.call("characteristic", residue_field.oscar()), ZZ(0))
         self.assertEqual(rho.oscar().domain(), L.oscar())
@@ -718,9 +723,9 @@ using .Issue11RestartRuntime
         self.assertEqual(residue_field.order(), ZZ(5))
         self.assertEqual(rho.kernel(), maximal)
         self.assertTrue(rho.is_surjective())
-        self.assertEqual(iota.oscar().getproperty("domain"), ZZ)
-        self.assertEqual(iota.oscar().getproperty("codomain").base_ring(), ZZ)
-        self.assertEqual(L.oscar().base_ring(), ZZ)
+        self.assertEqual(iota.oscar().getproperty("domain").sage(), ZZ)
+        self.assertEqual(iota.oscar().getproperty("codomain").base_ring().sage(), ZZ)
+        self.assertEqual(L.oscar().base_ring().sage(), ZZ)
         self.assertTrue(two.oscar().backend_equals(iota.oscar()(ZZ(2))))
 
         with self.assertRaises(ZeroDivisionError):
@@ -773,73 +778,121 @@ class Issue11GenericOscarSentinelTest(unittest.TestCase):
         cls.bridge.quit()
 
     def test_free_module_element_composes_without_codec(self) -> None:
-        element, module, doubled, coordinates, exact_parent = self.bridge.sage(
+        module, submodule, inclusion, quotient, projection, kernel, kernel_inclusion, relation = self.bridge.sage(
             """
 begin
     M = free_module(QQ, 3)
-    e = M([QQ(1), QQ(2), QQ(3)])
-    (e, parent(e), e + e, coordinates(e), parent(e) === M)
+    e1, e2, e3 = gens(M)
+    S, inc = sub(M, [e1 + 2*e2])
+    Q, proj = quo(M, S)
+    K, kinc = kernel(proj)
+    (M, S, inc, Q, proj, K, kinc, e1 + 2*e2)
 end
 """
         )
 
-        self.assertTrue(exact_parent)
-        self.assertEqual(coordinates, [ZZ(1), ZZ(2), ZZ(3)])
-        self.assertEqual(self.bridge.call("parent", element).identity_key(), module.identity_key())
-        self.assertEqual(self.bridge.call("coordinates", doubled), [ZZ(2), ZZ(4), ZZ(6)])
+        self.assertEqual(inclusion.domain().identity_key(), submodule.identity_key())
+        self.assertEqual(inclusion.codomain().identity_key(), module.identity_key())
+        self.assertEqual(projection.domain().identity_key(), module.identity_key())
+        self.assertEqual(projection.codomain().identity_key(), quotient.identity_key())
+        self.assertEqual(kernel_inclusion.domain().identity_key(), kernel.identity_key())
+        self.assertEqual(kernel_inclusion.codomain().identity_key(), module.identity_key())
+        self.assertTrue(self.bridge.call("is_zero", projection(relation)))
+        submodule_generator = self.bridge.call("gen", submodule, ZZ(1))
+        kernel_generator = self.bridge.call("gen", kernel, ZZ(1))
+        self.assertTrue(inclusion(submodule_generator).backend_equals(kernel_inclusion(kernel_generator)))
 
     def test_matrix_algebra_element_composes_without_codec(self) -> None:
-        algebra, element, square, exact_parent = self.bridge.sage(
+        algebra, center, center_inclusion, central_element, product, center_dimension = self.bridge.sage(
             """
 begin
     A = matrix_algebra(QQ, 2)
-    a = A(matrix(QQ, [1 2; 0 1]))
-    (A, a, a*a, parent(a) === A)
+    C, CtoA = center(A)
+    c = basis(C)[1]
+    a = A(matrix(QQ, [1 2; 3 5]))
+    (A, C, CtoA, CtoA(c), a*a, dimension_of_center(A))
 end
 """
         )
 
-        self.assertTrue(exact_parent)
-        self.assertEqual(self.bridge.call("parent", element).identity_key(), algebra.identity_key())
-        self.assertNotEqual(square.identity_key(), element.identity_key())
+        self.assertEqual(center_dimension, ZZ(1))
+        self.assertEqual(center_inclusion.domain().identity_key(), center.identity_key())
+        self.assertEqual(center_inclusion.codomain().identity_key(), algebra.identity_key())
+        self.assertEqual(self.bridge.call("parent", central_element).identity_key(), algebra.identity_key())
+        self.assertEqual(self.bridge.call("parent", product).identity_key(), algebra.identity_key())
+        self.assertTrue(self.bridge.call("is_central", algebra))
 
-    def test_scheme_and_lattice_inspection_use_same_object_runtime(self) -> None:
-        scheme, coordinate_ring, dimension, lattice, gram, rank = self.bridge.sage(
+    def test_affine_scheme_subobject_and_morphism_preserve_graph(self) -> None:
+        scheme, coordinate_ring, closed, closed_ring, inclusion, pullback, defining_kernel, identity_map = self.bridge.sage(
             """
 begin
-    R, (x, y) = polynomial_ring(QQ, [:x, :y])
-    X = spec(R)
-    L = quadratic_lattice(QQ; gram=matrix(QQ, [1 0; 0 -1]))
-    (X, coordinate_ring(X), dim(X), L, gram_matrix(L), rank(L))
+    X = affine_space(QQ, 3)
+    R = OO(X)
+    x1, x2, x3 = gens(R)
+    Y = subscheme(X, x1*x2 - x3)
+    S = OO(Y)
+    inc = inclusion_morphism(Y, X)
+    pb = pullback(inc)
+    K = kernel(pb)
+    (X, R, Y, S, inc, pb, K, identity_map(X))
 end
 """
         )
 
-        self.assertEqual(dimension, ZZ(2))
-        self.assertEqual(self.bridge.call("dim", scheme), ZZ(2))
-        self.assertEqual(self.bridge.call("coordinate_ring", scheme), coordinate_ring)
-        self.assertEqual(rank, ZZ(2))
-        self.assertEqual(gram, matrix(ZZ, [[1, 0], [0, -1]]))
-        self.assertEqual(self.bridge.call("gram_matrix", lattice), gram)
+        self.assertEqual(inclusion.domain().identity_key(), closed.identity_key())
+        self.assertEqual(inclusion.codomain().identity_key(), scheme.identity_key())
+        self.assertEqual(pullback.domain().identity_key(), coordinate_ring.identity_key())
+        self.assertEqual(pullback.codomain().identity_key(), closed_ring.identity_key())
+        self.assertEqual(self.bridge.call("base_ring", defining_kernel).identity_key(), pullback.domain().identity_key())
+        self.assertTrue(self.bridge.call("compose", inclusion, identity_map).backend_equals(inclusion))
 
-    def test_group_and_heterogeneous_graph_preserve_identity(self) -> None:
-        module, element, repeated_module, group, generator, repeated_group, group_order = self.bridge.sage(
+    def test_indefinite_lattice_ambient_space_and_invariants(self) -> None:
+        lattice, ambient, gram, scaled, scaled_ambient, determinant, signature = self.bridge.sage(
             """
 begin
-    M = free_module(QQ, 2)
-    e = M([QQ(3), QQ(5)])
+    G = matrix(QQ, [1 0 0; 0 -1 0; 0 0 2])
+    L = quadratic_lattice(QQ; gram=G)
+    M = 2*L
+    (L, ambient_space(L), gram_matrix(L), M, ambient_space(M), det(gram_matrix(L)), signature_tuple(L))
+end
+"""
+        )
+
+        self.assertEqual(determinant, ZZ(-2))
+        self.assertEqual(signature, [ZZ(2), ZZ(0), ZZ(1)])
+        self.assertEqual(self.bridge.call("rank", lattice), ZZ(3))
+        self.assertEqual(self.bridge.call("ambient_space", lattice).identity_key(), ambient.identity_key())
+        self.assertEqual(self.bridge.call("ambient_space", scaled).identity_key(), scaled_ambient.identity_key())
+        self.assertTrue(self.bridge.call("is_integral", scaled))
+        self.assertEqual(self.bridge.call("det", gram), ZZ(-2))
+
+    def test_group_subgroup_homomorphism_and_heterogeneous_graph(self) -> None:
+        group, subgroup, embedding, homomorphism, image, image_embedding, module, projection, repeated = self.bridge.sage(
+            """
+begin
     G = symmetric_group(4)
-    g = gens(G)[1]
-    (M, e, M, G, g, G, order(G))
+    H, emb = derived_subgroup(G)
+    phi = id_hom(G)
+    I, iemb = image(phi)
+    M = free_module(QQ, 2)
+    S, _ = sub(M, [gen(M, 1)])
+    Q, proj = quo(M, S)
+    (G, H, emb, phi, I, iemb, M, proj, Any[G, M, phi, proj, G, M])
 end
 """
         )
 
-        self.assertEqual(module.identity_key(), repeated_module.identity_key())
-        self.assertEqual(group.identity_key(), repeated_group.identity_key())
-        self.assertEqual(self.bridge.call("parent", element).identity_key(), module.identity_key())
-        self.assertEqual(self.bridge.call("parent", generator).identity_key(), group.identity_key())
-        self.assertEqual(group_order, ZZ(24))
+        self.assertEqual(embedding.domain().identity_key(), subgroup.identity_key())
+        self.assertEqual(embedding.codomain().identity_key(), group.identity_key())
+        self.assertEqual(homomorphism.domain().identity_key(), group.identity_key())
+        self.assertEqual(homomorphism.codomain().identity_key(), group.identity_key())
+        self.assertEqual(image_embedding.domain().identity_key(), image.identity_key())
+        self.assertEqual(self.bridge.call("order", subgroup), ZZ(12))
+        self.assertEqual(projection.domain().identity_key(), module.identity_key())
+        self.assertEqual(repeated[0].identity_key(), repeated[4].identity_key())
+        self.assertEqual(repeated[1].identity_key(), repeated[5].identity_key())
+        self.assertEqual(repeated[2].identity_key(), homomorphism.identity_key())
+        self.assertEqual(repeated[3].identity_key(), projection.identity_key())
 
 
 class MrdiCodecTest(unittest.TestCase):
@@ -1193,8 +1246,13 @@ end
     def test_parent_objects_decode(self) -> None:
         from sage.all import GF
 
-        self.assertIs(self.bridge.sage("ZZ"), ZZ)
-        self.assertIs(self.bridge.sage("GF(7)"), GF(7))
+        integer_ring = self.bridge.sage("ZZ")
+        finite_field = self.bridge.sage("GF(7)")
+
+        self.assertIsInstance(integer_ring, JuliaHandle)
+        self.assertIsInstance(finite_field, JuliaHandle)
+        self.assertIs(integer_ring.sage(), ZZ)
+        self.assertIs(finite_field.sage(), GF(7))
 
     def test_qualified_import_oscar(self) -> None:
         # `import Oscar` binds only Main.Oscar — Nemo must be resolved from

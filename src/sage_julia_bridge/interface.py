@@ -169,6 +169,9 @@ class JuliaHandle:
         values = self._operation("iterate")
         return iter(values)
 
+    def __contains__(self, value: object) -> bool:
+        return bool(self._operation("contains", value=self._bridge._encode_value(value)))
+
     def backend_identical(self, other: object) -> bool:
         return bool(self._operation("identical", other=self._bridge._encode_value(other)))
 
@@ -542,6 +545,14 @@ class Julia:
 
     def sage(self, code: str) -> Any:
         response = self._request("value", code)
+        return self._decode_value(response.structured, response.display)
+
+    def resolve(self, path: str) -> Any:
+        """Resolve a global Julia module/function/object without evaluating source."""
+
+        if not all(_JULIA_IDENTIFIER.fullmatch(part) for part in path.split(".")):
+            raise ValueError(f"invalid Julia object path: {path!r}")
+        response = self._request("resolve", path)
         return self._decode_value(response.structured, response.display)
 
     def __call__(self, code: str) -> Any:

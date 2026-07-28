@@ -12,6 +12,7 @@ const BRIDGE_CAPABILITIES = [
     "runtime.call-object",
     "runtime.properties",
     "runtime.indexing",
+    "runtime.containment",
     "runtime.iteration",
     "runtime.length",
     "runtime.identity",
@@ -147,6 +148,10 @@ const MRDI_WHITELIST = Set([
     "MatSpace", "MatElem",
     "Vector", "Tuple",
 ])
+const MRDI_RETAINED_ROOTS = Set([
+    "ZZRing", "QQField", "Nemo.zzModRing", "Nemo.ZZModRing",
+    "FiniteField", "PolyRing", "MPolyRing", "MatSpace",
+])
 
 function walk_type_names!(names::Vector{String}, node, in_type::Bool)
     if node isa AbstractDict
@@ -186,7 +191,16 @@ end
 # inside the pinned subset; nothing means the value takes the handle tier
 # (either Oscar is absent, Oscar cannot serialize it, or a type falls
 # outside the whitelist).
-function try_mrdi(x)
+function mrdi_root_name(doc)
+    root = doc["_type"]
+    root isa AbstractString && return root
+    root isa AbstractDict || return nothing
+    haskey(root, "name") || return nothing
+    name = root["name"]
+    return name isa AbstractString ? name : nothing
+end
+
+function try_mrdi(x; retain_identity::Bool)
     isdefined(Main, :Oscar) || return nothing
     io = IOBuffer()
     try
@@ -198,6 +212,7 @@ function try_mrdi(x)
     doc = JSON.parse(raw)
     names = walk_type_names!(String[], doc, false)
     issubset(Set(names), MRDI_WHITELIST) || return nothing
+    retain_identity && mrdi_root_name(doc) in MRDI_RETAINED_ROOTS && return nothing
     return "{\"type\":\"mrdi\",\"data\":" * raw * "}"
 end
 
@@ -235,7 +250,7 @@ function encode_value(x, wrap::Bool)
     end
     encoded = encode_supported(x)
     encoded === nothing || return encoded
-    encoded = try_mrdi(x)
+    encoded = try_mrdi(x; retain_identity=wrap)
     encoded === nothing || return encoded
     if !wrap
         return "{\"type\":\"unsupported\",\"julia_type\":" * json_string(string(typeof(x))) * "}"
@@ -416,6 +431,10 @@ function execute_batch_step(step::AbstractDict, bindings::Dict{String,Any})
     elseif op == "iterate"
         object = decode_batch_value(step["object"], bindings)
         return collect_by_iteration(object)
+    elseif op == "contains"
+        object = decode_batch_value(step["object"], bindings)
+        value = decode_batch_value(step["value"], bindings)
+        return in(value, object)
     elseif op == "identical"
         object = decode_batch_value(step["object"], bindings)
         other = decode_batch_value(step["other"], bindings)
@@ -473,6 +492,9 @@ function handle_request(op::String, payload::String)
     elseif op == "value"
         value, stdout_text, stderr_text = evaluate(payload)
         return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "resolve"
+        value, stdout_text, stderr_text = capture(() -> resolve_path(payload))
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
     elseif op == "set"
         request = JSON.parse(payload)
         name = Symbol(request["name"]::String)
@@ -526,6 +548,10 @@ function handle_request(op::String, payload::String)
             return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
         elseif object_op == "iterate"
             value, stdout_text, stderr_text = capture(() -> collect_by_iteration(object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "contains"
+            value_node = request["value"]
+            value, stdout_text, stderr_text = capture(() -> in(decode_value(value_node), object))
             return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
         elseif object_op == "identical"
             other = decode_value(request["other"])
