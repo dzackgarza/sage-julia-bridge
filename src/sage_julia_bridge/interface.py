@@ -157,7 +157,12 @@ class JuliaHandle:
         return self._operation("getindex", index=self._bridge._encode_value(index))
 
     def __len__(self) -> int:
-        return int(self._operation("length"))
+        try:
+            return int(self._operation("length"))
+        except JuliaError as exc:
+            if exc.backend_type == "MethodError":
+                raise TypeError("Julia length is not defined for this object") from exc
+            raise
 
     def __iter__(self) -> Iterator[Any]:
         values = self._operation("iterate")
