@@ -24,6 +24,22 @@ class JuliaProtocolError(JuliaError):
     """Raised when data crossing the bridge violates the wire format."""
 
 
+class JuliaWorkerError(JuliaError):
+    """Raised when the Julia subprocess dies during a request."""
+
+
+class JuliaDispatchError(JuliaError):
+    """Raised when Julia multiple dispatch finds no applicable method."""
+
+
+class JuliaStaleObjectError(JuliaError):
+    """Raised when a foreign object belongs to an earlier worker generation."""
+
+
+class JuliaReleasedObjectError(JuliaError):
+    """Raised when a deterministically released foreign object is reused."""
+
+
 class JuliaConversionError(JuliaError, TypeError):
     """Raised when explicit Sage/Julia conversion is refused."""
 

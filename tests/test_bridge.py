@@ -9,9 +9,13 @@ from sage.all import QQ, ZZ, matrix, vector
 from sage_julia_bridge import (
     Julia,
     JuliaConversionError,
+    JuliaDispatchError,
     JuliaError,
     JuliaHandle,
     JuliaProtocolError,
+    JuliaReleasedObjectError,
+    JuliaStaleObjectError,
+    JuliaWorkerError,
     SageOscarRealizationMap,
     batch_ref,
     julia,
@@ -481,12 +485,12 @@ using .Issue11ReleaseRuntime
             first.release()
             self.assertEqual(bridge.call("box_value", second), ZZ(97))
             self.assertEqual(second.introspect()["retained_references"], ZZ(1))
-            with self.assertRaises(JuliaError) as released:
+            with self.assertRaises(JuliaReleasedObjectError) as released:
                 first.sage()
             self.assertEqual(getattr(released.exception, "kind"), "released-object")
             second.release()
             second.release()
-            with self.assertRaises(JuliaError) as again_released:
+            with self.assertRaises(JuliaReleasedObjectError) as again_released:
                 second.getproperty("value")
             self.assertEqual(getattr(again_released.exception, "kind"), "released-object")
 
@@ -530,6 +534,9 @@ using .Issue11ReleaseRuntime
         with self.assertRaises(JuliaError) as raised:
             self.bridge.call("explode_structured", box)
         self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
+        with self.assertRaises(JuliaDispatchError) as dispatch:
+            self.bridge.call("sin", box)
+        self.assertEqual(getattr(dispatch.exception, "backend_type"), "MethodError")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(23))
 
     def test_structured_batch_preserves_intermediate_identity_in_one_request(self) -> None:
@@ -599,12 +606,12 @@ using .Issue11RestartRuntime
             )
             old_pid = bridge.sage("getpid()")
             stale = bridge.sage("Box(31)")
-            with self.assertRaises(JuliaError):
+            with self.assertRaises(JuliaWorkerError):
                 bridge.eval("exit(86)")
             new_pid = bridge.sage("getpid()")
 
             self.assertNotEqual(new_pid, old_pid)
-            with self.assertRaises(JuliaError) as raised:
+            with self.assertRaises(JuliaStaleObjectError) as raised:
                 stale.getproperty("value")
             self.assertEqual(getattr(raised.exception, "kind"), "stale-object")
             self.assertEqual(bridge.sage("1 + 1"), ZZ(2))

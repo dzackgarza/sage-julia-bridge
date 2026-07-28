@@ -31,7 +31,15 @@ from sage.rings.rational_field import QQ
 from sage.structure.element import Matrix, Vector
 
 from sage_julia_bridge.conversion import ConversionRegistry
-from sage_julia_bridge.errors import JuliaConversionError, JuliaError, JuliaProtocolError
+from sage_julia_bridge.errors import (
+    JuliaConversionError,
+    JuliaDispatchError,
+    JuliaError,
+    JuliaProtocolError,
+    JuliaReleasedObjectError,
+    JuliaStaleObjectError,
+    JuliaWorkerError,
+)
 from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
 
 type StructuredValue = dict[str, Any]
@@ -87,9 +95,9 @@ class JuliaHandle:
         # Ids restart with each worker process; a stale id would silently
         # resolve to a different object in the new worker's table.
         if self._generation != self._bridge._generation:
-            raise JuliaError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
+            raise JuliaStaleObjectError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
         if self._released:
-            raise JuliaError(f"released Julia handle cannot be used: {self!r}", kind="released-object")
+            raise JuliaReleasedObjectError(f"released Julia handle cannot be used: {self!r}", kind="released-object")
 
     def _operation(self, operation: str, **payload: object) -> Any:
         self._assert_current()
@@ -345,12 +353,12 @@ class Julia:
             self._proc.stdin.flush()
         except BrokenPipeError as exc:
             self._mark_worker_dead()
-            raise JuliaError(self._dead_process_message()) from exc
+            raise JuliaWorkerError(self._dead_process_message(), kind="worker-death") from exc
 
         line = self._proc.stdout.readline()
         if not line:
             self._mark_worker_dead()
-            raise JuliaError(self._dead_process_message())
+            raise JuliaWorkerError(self._dead_process_message(), kind="worker-death")
 
         parts = line.rstrip("\n").split("\t")
         status = parts[0]
@@ -371,7 +379,8 @@ class Julia:
             stderr_text = self._decode(parts[3])
             error_data = json.loads(error_payload)
             message = self._merge_text(error_data["message"], stdout_text, stderr_text)
-            raise JuliaError(
+            error_class = JuliaDispatchError if error_data["backend_type"] == "MethodError" else JuliaError
+            raise error_class(
                 message,
                 kind=error_data["kind"],
                 backend_type=error_data["backend_type"],

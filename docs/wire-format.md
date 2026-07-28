@@ -1,13 +1,40 @@
 # Bridge wire format
 
-This document is the single source of truth for every value that crosses the bridge in either direction.
-Both codecs (`interface.py`/`mrdi.py` on the Sage side, `julia_bridge.jl` on the worker side) implement exactly this grammar.
-A value outside it is a `JuliaHandle` (Julia→Sage) or a loud `TypeError` (Sage→Julia input).
-Nothing is ever converted by display text, `eval`, or a guessed parent.
+This document defines the transport, retained-object, and conversion contracts.
+`interface.py`, `conversion.py`, `mrdi.py`, and `julia_bridge.jl` implement them.
+Display text never establishes identity or conversion.
 
 ## Protocol framing
 
-One request per line on the worker's stdin: `op \t base64(payload)`. Ops: `exec`, `value`, `set`, `call`, `materialize`, `release`, `ping`, `quit`. One reply per line: `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)` or `err \t b64(message) \t b64("") \t b64("")`.
+One request occupies one line on the worker's stdin: `op \t base64(payload)`.
+Protocol version 1 negotiates capabilities with `hello` before ordinary requests.
+Operations include `exec`, `value`, `resolve`, `set`, `call`, `call_object`, `object`, `batch`, `materialize`, `release`, `ping`, and `quit`.
+
+A successful reply is `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)`.
+An error reply is `err \t b64(json_error) \t b64(stdout) \t b64(stderr)`.
+The JSON error carries `kind`, Julia exception type, message, and backend stack.
+Protocol violations, conversion refusal, parent incompatibility, released objects, stale objects, backend dispatch, and worker death remain distinguishable.
+
+## Retained-object runtime
+
+A `handle` node identifies one worker-owned Julia value.
+Its Sage proxy records the bridge session and worker generation, so a restarted worker cannot alias an old ID.
+Repeated references in nested results reuse one backend ID.
+Each live proxy contributes one retained reference.
+`release()` is public and idempotent; garbage collection queues automatic release under the request lock.
+
+Foreign objects support:
+
+- returned and global callables, closures, callable structs, and modules;
+- property access and legal mutation;
+- indexing, legal indexed mutation, containment, length, and iteration;
+- backend equality and identity;
+- type, display, applicability, and retained-reference introspection;
+- recursive native, foreign, and heterogeneous arguments and results.
+
+`resolve(path)` performs symbol lookup without source evaluation.
+`batch` executes a structured operation graph in one request and preserves intermediate identities.
+Text evaluation is a separate expert operation.
 
 ## Bridge nodes
 
@@ -22,7 +49,7 @@ The `structured` slot and all `set`/`call` values are JSON trees of these nodes 
 | `rational` | `num`, `den`: decimal strings | `Rational{BigInt}` | Sage `QQ` |
 | `vector` | `data`: list of nodes | `Vector` (container) | Python `list` |
 | `matrix` | `nrows`, `ncols`, `data`: row-major nodes | `Matrix` | Sage matrix (ring determined by the typed entries) |
-| `handle` | `id`, `julia_type`, `display` | worker `HANDLES[id]` | `JuliaHandle` |
+| `handle` | `id`, `julia_type`, `display` | retained worker value | live `JuliaHandle` |
 | `mrdi` | `data`: an mrdi document (below) | via `Oscar.Serialization` | via `mrdi.py` |
 | `unsupported` | `julia_type` | — (materialize refusal) | raises `TypeError` |
 
@@ -31,7 +58,9 @@ No parent is ever inferred from container entries — the `int`/`rational` entri
 
 ## mrdi subset
 
-The `mrdi` node carries a document in Oscar's serialization format (`_ns`/`_type`/`data`/`_refs`), pinned to `_ns = {"Oscar": [..., "1.7.1"]}`. The Sage decoder rejects any other namespace or version.
+The `mrdi` node is an explicit value-conversion mechanism, not an object-admission gate.
+It carries an Oscar serialization document (`_ns`/`_type`/`data`/`_refs`) pinned to `_ns = {"Oscar": [..., "1.7.1"]}`.
+The Sage decoder rejects other namespaces and versions.
 The admissible `_type` names — everywhere in the document, including `_refs` — are exactly:
 
 ```
@@ -43,7 +72,13 @@ MatSpace  MatElem
 Vector  Tuple
 ```
 
-A document containing any other `_type` name is outside the subset: the worker routes the value to a handle instead of emitting it, and the Sage decoder hard-rejects it if received.
+A document containing another `_type` name is outside this conversion subset.
+The worker retains the original value as a usable foreign object.
+The Sage decoder hard-rejects such a document if received.
+
+MRDI-supported parent objects remain retained by default because copying would erase backend identity.
+Explicit `.sage()` conversion may materialize them.
+Value-like supported elements continue to convert automatically.
 
 ### Parent identifications
 
@@ -88,14 +123,31 @@ Schema-layer violations are hard protocol rejections by the decoder itself: unkn
 Mathematics-layer violations (zero denominator, reducible claimed-irreducible modulus, residue out of range) are delegated to the target parent constructors and their errors propagate unmodified.
 Neither layer ever falls back to display text.
 
-## Explicit non-goals of this subset
+## Conversion limits
 
-Routed to handles (Julia→Sage) or rejected loudly (Sage→Julia input):
+These values have no built-in native conversion.
+Julia results remain usable as retained objects; Sage inputs require a registered outbound conversion:
 
 - `Frac(P)`, quotient rings `A/I`, number fields — tranche 2 (issue #1).
 
-- Free modules and `matrix_ring` (`MatRing`) elements — Oscar 1.7.1 cannot serialize them (`save` raises); revisit when upstream can.
+- Free modules and `matrix_ring` (`MatRing`) elements.
 
 - Sage multivariate rings with non-degrevlex term orders (see ordering resolution).
 
-- Floats, balls, p-adics, series, symbolic expressions, embeddings, weighted or block orderings, groups, schemes, morphisms, and everything else not listed above.
+- Floats, balls, p-adics, series, symbolic expressions, embeddings, weighted or block orderings, groups, schemes, morphisms, and other unregistered values.
+
+Conversion refusal raises `JuliaConversionError`.
+It never releases or invalidates the foreign object.
+
+## Layer boundaries
+
+Dependencies point downward:
+
+1. Native Sage facades and optional domain adapters
+2. Sage–Oscar realization maps
+3. Explicit conversion registry and MRDI conversion
+4. Generic retained-object runtime
+5. Versioned subprocess transport
+
+The Python and Julia kernel files do not import domain facades or dispatch on Oscar domain types.
+Julia domain adapters live in separate `*_backend.jl` files and load through a generic adapter-discovery rule.
