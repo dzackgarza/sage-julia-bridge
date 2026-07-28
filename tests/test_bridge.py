@@ -418,7 +418,7 @@ using .Issue11FreshRuntime
 
         with self.assertRaises(JuliaError) as raised:
             self.bridge.call("explode_structured", box)
-        self.assertEqual(raised.exception.backend_type, "DomainError")
+        self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(23))
 
     def test_half_dead_worker_exit_restarts_and_stales_old_objects(self) -> None:
@@ -444,12 +444,15 @@ using .Issue11RestartRuntime
             self.assertNotEqual(new_pid, old_pid)
             with self.assertRaises(JuliaError) as raised:
                 stale.getproperty("value")
-            self.assertEqual(raised.exception.kind, "stale-object")
+            self.assertEqual(getattr(raised.exception, "kind"), "stale-object")
             self.assertEqual(bridge.sage("1 + 1"), ZZ(2))
 
     def test_prime_localization_returns_native_sage_facade_objects(self) -> None:
         from sage.all import PolynomialRing
-        from sage_julia_bridge import prime_localization
+
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
 
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
