@@ -19,6 +19,7 @@ import threading
 import uuid
 from collections import deque
 from collections.abc import Iterator
+from dataclasses import dataclass
 from numbers import Integral, Rational
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,19 @@ from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
 type StructuredValue = dict[str, Any]
 
 _JULIA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
+
+
+@dataclass(frozen=True)
+class JuliaBatchRef:
+    """Reference to a named intermediate value in a structured batch."""
+
+    name: str
+
+
+def batch_ref(name: str) -> JuliaBatchRef:
+    """Create a reference to a named value inside ``Julia.batch``."""
+
+    return JuliaBatchRef(name)
 
 
 class BridgeResponse(BaseModel):
@@ -386,6 +400,54 @@ class Julia:
         msg = f"unsupported Julia bridge input type: {type(value).__name__}; use eval(...) with Julia source for values outside the structured codec"
         raise TypeError(msg)
 
+    def _encode_batch_value(self, value: object) -> StructuredValue:
+        if isinstance(value, JuliaBatchRef):
+            return {"type": "batch_ref", "name": value.name}
+        if isinstance(value, (Vector, list, tuple)):
+            return {
+                "type": "vector",
+                "data": [self._encode_batch_value(entry) for entry in value],
+            }
+        if isinstance(value, Matrix):
+            entries = [self._encode_batch_value(value[i, j]) for i in range(value.nrows()) for j in range(value.ncols())]
+            return {
+                "type": "matrix",
+                "nrows": value.nrows(),
+                "ncols": value.ncols(),
+                "data": entries,
+            }
+        return self._encode_value(value)
+
+    def _encode_batch_step(self, step: dict[str, Any]) -> dict[str, Any]:
+        encoded = {key: value for key, value in step.items() if key not in {"args", "kwargs", "value", "function", "index", "object"}}
+        op = step["op"]
+        if "function" in step:
+            function = step["function"]
+            encoded["function"] = function if isinstance(function, str) else self._encode_batch_value(function)
+        if "args" in step:
+            step_args = step["args"]
+        elif op in {"call", "call_object"}:
+            step_args = []
+        else:
+            step_args = None
+        if step_args is not None:
+            encoded["args"] = [self._encode_batch_value(arg) for arg in step_args]
+        if "kwargs" in step:
+            step_kwargs = step["kwargs"]
+        elif op in {"call", "call_object"}:
+            step_kwargs = {}
+        else:
+            step_kwargs = None
+        if step_kwargs is not None:
+            encoded["kwargs"] = {key: self._encode_batch_value(value) for key, value in step_kwargs.items()}
+        if "object" in step:
+            encoded["object"] = self._encode_batch_value(step["object"])
+        if "value" in step:
+            encoded["value"] = self._encode_batch_value(step["value"])
+        if "index" in step:
+            encoded["index"] = self._encode_batch_value(step["index"])
+        return encoded
+
     def _decode_value(self, payload: str | StructuredValue, display: str) -> Any:
         data = json.loads(payload) if isinstance(payload, str) else payload
         kind = data["type"]
@@ -446,6 +508,13 @@ class Julia:
             }
         )
         response = self._request("call", payload)
+        return self._decode_value(response.structured, response.display)
+
+    def batch(self, steps: list[dict[str, Any]]) -> Any:
+        """Run structured Julia operations in one subprocess request."""
+
+        payload = json.dumps({"steps": [self._encode_batch_step(step) for step in steps]})
+        response = self._request("batch", payload)
         return self._decode_value(response.structured, response.display)
 
     def version(self) -> str:

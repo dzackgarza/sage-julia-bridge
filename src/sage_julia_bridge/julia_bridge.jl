@@ -257,6 +257,25 @@ function decode_value(node::AbstractDict)
     error("unknown bridge value type: ", kind)
 end
 
+function decode_batch_value(node::AbstractDict, bindings::Dict{String,Any})
+    kind = node["type"]::String
+    if kind == "batch_ref"
+        name = node["name"]::String
+        haskey(bindings, name) || error("unknown batch reference: ", name)
+        return bindings[name]
+    elseif kind == "vector"
+        return [decode_batch_value(item, bindings) for item in node["data"]]
+    elseif kind == "matrix"
+        nrows = node["nrows"]::Int
+        ncols = node["ncols"]::Int
+        data = node["data"]
+        length(data) == nrows * ncols ||
+            error("matrix payload has ", length(data), " entries for ", nrows, "x", ncols)
+        return [decode_batch_value(data[(i - 1) * ncols + j], bindings) for i in 1:nrows, j in 1:ncols]
+    end
+    return decode_value(node)
+end
+
 # Values are never interpolated into source: a function path is resolved as a
 # chain of symbol lookups, which cannot execute code.
 function resolve_path(path::AbstractString)
@@ -318,6 +337,51 @@ function collect_by_iteration(x)
     return values
 end
 
+function execute_batch_step(step::AbstractDict, bindings::Dict{String,Any})
+    op = step["op"]::String
+    if op == "call"
+        f = resolve_path(step["function"]::String)
+        args = Any[decode_batch_value(item, bindings) for item in step["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_batch_value(item, bindings) for (key, item) in step["kwargs"]]
+        return f(args...; kwargs...)
+    elseif op == "call_object"
+        f = decode_batch_value(step["function"], bindings)
+        args = Any[decode_batch_value(item, bindings) for item in step["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_batch_value(item, bindings) for (key, item) in step["kwargs"]]
+        return f(args...; kwargs...)
+    elseif op == "getproperty"
+        object = decode_batch_value(step["object"], bindings)
+        return getproperty(object, Symbol(step["name"]::String))
+    elseif op == "setproperty"
+        object = decode_batch_value(step["object"], bindings)
+        value = decode_batch_value(step["value"], bindings)
+        return setproperty!(object, Symbol(step["name"]::String), value)
+    elseif op == "getindex"
+        object = decode_batch_value(step["object"], bindings)
+        index = decode_batch_value(step["index"], bindings)
+        return getindex(object, index)
+    elseif op == "iterate"
+        object = decode_batch_value(step["object"], bindings)
+        return collect_by_iteration(object)
+    elseif op == "result"
+        return decode_batch_value(step["value"], bindings)
+    end
+    error("unknown batch operation: ", op)
+end
+
+function execute_batch(steps)
+    bindings = Dict{String,Any}()
+    last_value = nothing
+    for step in steps
+        value = execute_batch_step(step, bindings)
+        if haskey(step, "bind")
+            bindings[step["bind"]::String] = value
+        end
+        last_value = value
+    end
+    return last_value
+end
+
 function reply(parts::Vector{String})
     println(stdout, join(parts, '\t'))
     flush(stdout)
@@ -356,6 +420,10 @@ function handle_request(op::String, payload::String)
         args = Any[decode_value(item) for item in request["args"]]
         kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
         value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "batch"
+        request = JSON.parse(payload)
+        value, stdout_text, stderr_text = capture(() -> execute_batch(request["steps"]))
         return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
     elseif op == "object"
         request = JSON.parse(payload)

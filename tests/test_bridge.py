@@ -11,7 +11,9 @@ from sage_julia_bridge import (
     JuliaError,
     JuliaHandle,
     JuliaProtocolError,
+    batch_ref,
 )
+from sage_julia_bridge.interface import BridgeResponse
 
 
 class JuliaBridgeTest(unittest.TestCase):
@@ -448,6 +450,57 @@ using .Issue11FreshRuntime
             self.bridge.call("explode_structured", box)
         self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(23))
+
+    def test_structured_batch_preserves_intermediate_identity_in_one_request(self) -> None:
+        class CountingJulia(Julia):
+            def __init__(self) -> None:
+                super().__init__()
+                self.operations: list[str] = []
+
+            def _request_unlocked(self, op: str, payload: str) -> BridgeResponse:
+                self.operations.append(op)
+                return super()._request_unlocked(op, payload)
+
+        bridge = CountingJulia()
+        try:
+            bridge.eval(
+                """
+module Issue11BatchRuntime
+export Box, box_value, same_object, explode_structured
+
+mutable struct Box
+    value::Int
+end
+
+box_value(box::Box) = box.value
+same_object(left, right) = left === right
+explode_structured(::Box) = throw(DomainError(:issue11_box, "structured backend failure witness"))
+end
+using .Issue11BatchRuntime
+"""
+            )
+            box = bridge.sage("Box(29)")
+            bridge.operations.clear()
+            first, second, value = bridge.batch(
+                [
+                    {"op": "call", "bind": "first", "function": "identity", "args": [box]},
+                    {"op": "call", "bind": "second", "function": "identity", "args": [batch_ref("first")]},
+                    {"op": "call", "bind": "value", "function": "box_value", "args": [batch_ref("second")]},
+                    {"op": "result", "value": [batch_ref("first"), batch_ref("second"), batch_ref("value")]},
+                ]
+            )
+
+            self.assertEqual(bridge.operations, ["batch"])
+            self.assertEqual(value, ZZ(29))
+            self.assertEqual(first.identity_key(), second.identity_key())
+            self.assertTrue(bridge.call("same_object", first, box))
+
+            with self.assertRaises(JuliaError) as raised:
+                bridge.batch([{"op": "call", "function": "explode_structured", "args": [box]}])
+            self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
+            self.assertEqual(bridge.call("box_value", box), ZZ(29))
+        finally:
+            bridge.quit()
 
     def test_half_dead_worker_exit_restarts_and_stales_old_objects(self) -> None:
         with Julia() as bridge:
