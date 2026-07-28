@@ -77,6 +77,7 @@ class JuliaHandle:
         self._generation = bridge._generation
         self._julia_type = julia_type
         self._display = display
+        self._released = False
 
     def __repr__(self) -> str:
         return f"JuliaHandle<{self._julia_type}>({self._display})"
@@ -86,6 +87,8 @@ class JuliaHandle:
         # resolve to a different object in the new worker's table.
         if self._generation != self._bridge._generation:
             raise JuliaError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
+        if self._released:
+            raise JuliaError(f"released Julia handle cannot be used: {self!r}", kind="released-object")
 
     def _operation(self, operation: str, **payload: object) -> Any:
         self._assert_current()
@@ -112,8 +115,9 @@ class JuliaHandle:
         return self._bridge._decode_value(response.structured, response.display)
 
     def release(self) -> None:
-        if self._generation == self._bridge._generation:
+        if not self._released and self._generation == self._bridge._generation:
             self._bridge._request("release", str(self._id))
+        self._released = True
 
     def identity_key(self) -> tuple[str, int, int]:
         self._assert_current()
@@ -124,6 +128,16 @@ class JuliaHandle:
 
     def setproperty(self, name: str, value: object) -> Any:
         return self._operation("setproperty", name=name, value=self._bridge._encode_value(value))
+
+    def setindex(self, value: object, index: object) -> Any:
+        return self._operation(
+            "setindex",
+            index=self._bridge._encode_value(index),
+            value=self._bridge._encode_value(value),
+        )
+
+    def __setitem__(self, index: object, value: object) -> None:
+        self.setindex(value, index)
 
     def __call__(self, *args: object, **kwds: object) -> Any:
         self._assert_current()
@@ -142,9 +156,29 @@ class JuliaHandle:
     def __getitem__(self, index: object) -> Any:
         return self._operation("getindex", index=self._bridge._encode_value(index))
 
+    def __len__(self) -> int:
+        return int(self._operation("length"))
+
     def __iter__(self) -> Iterator[Any]:
         values = self._operation("iterate")
         return iter(values)
+
+    def backend_identical(self, other: object) -> bool:
+        return bool(self._operation("identical", other=self._bridge._encode_value(other)))
+
+    def backend_equals(self, other: object) -> bool:
+        return bool(self._operation("equal", other=self._bridge._encode_value(other)))
+
+    def introspect(self) -> dict[str, Any]:
+        entries = self._operation("introspect")
+        return {str(key): value for key, value in entries}
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, JuliaHandle):
+            return False
+        if self._bridge is not other._bridge or self._generation != other._generation:
+            return False
+        return self.backend_equals(other)
 
     def _binary(self, function: str, other: object) -> Any:
         return self._bridge.call(function, self, other)
@@ -174,7 +208,7 @@ class JuliaHandle:
         # Only enqueue: sending a request here could interleave with an
         # in-flight request on the same pipe (GC runs at arbitrary points).
         # Stale handles enqueue nothing: the value died with its worker.
-        if self._generation == self._bridge._generation:
+        if not self._released and self._generation == self._bridge._generation:
             self._bridge._pending_releases.append(self._id)
 
 
@@ -419,7 +453,7 @@ class Julia:
         return self._encode_value(value)
 
     def _encode_batch_step(self, step: dict[str, Any]) -> dict[str, Any]:
-        encoded = {key: value for key, value in step.items() if key not in {"args", "kwargs", "value", "function", "index", "object"}}
+        encoded = {key: value for key, value in step.items() if key not in {"args", "kwargs", "value", "function", "index", "object", "other"}}
         op = step["op"]
         if "function" in step:
             function = step["function"]
@@ -442,6 +476,8 @@ class Julia:
             encoded["kwargs"] = {key: self._encode_batch_value(value) for key, value in step_kwargs.items()}
         if "object" in step:
             encoded["object"] = self._encode_batch_value(step["object"])
+        if "other" in step:
+            encoded["other"] = self._encode_batch_value(step["other"])
         if "value" in step:
             encoded["value"] = self._encode_batch_value(step["value"])
         if "index" in step:

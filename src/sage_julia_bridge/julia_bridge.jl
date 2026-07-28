@@ -93,14 +93,19 @@ end
 # cover. Keyed by a monotone id; entries live until the client releases them.
 const HANDLES = Dict{Int,Any}()
 const HANDLE_IDS = IdDict{Any,Int}()
+const HANDLE_REFS = Dict{Int,Int}()
 const HANDLE_COUNTER = Ref(0)
 
 function register_handle(x)
     existing = get(HANDLE_IDS, x, nothing)
-    existing === nothing || return existing
+    if existing !== nothing
+        HANDLE_REFS[existing] = HANDLE_REFS[existing] + 1
+        return existing
+    end
     id = (HANDLE_COUNTER[] += 1)
     HANDLES[id] = x
     HANDLE_IDS[x] = id
+    HANDLE_REFS[id] = 1
     return id
 end
 
@@ -337,6 +342,18 @@ function collect_by_iteration(x)
     return values
 end
 
+function object_introspection(id::Int, x)
+    return Any[
+        ("id", id),
+        ("julia_type", string(typeof(x))),
+        ("display", display_text(x)),
+        ("retained_references", HANDLE_REFS[id]),
+        ("length_applicable", applicable(length, x)),
+        ("iteration_applicable", applicable(iterate, x)),
+        ("indexing_applicable", applicable(getindex, x, 1)),
+    ]
+end
+
 function execute_batch_step(step::AbstractDict, bindings::Dict{String,Any})
     op = step["op"]::String
     if op == "call"
@@ -360,9 +377,30 @@ function execute_batch_step(step::AbstractDict, bindings::Dict{String,Any})
         object = decode_batch_value(step["object"], bindings)
         index = decode_batch_value(step["index"], bindings)
         return getindex(object, index)
+    elseif op == "setindex"
+        object = decode_batch_value(step["object"], bindings)
+        index = decode_batch_value(step["index"], bindings)
+        value = decode_batch_value(step["value"], bindings)
+        return setindex!(object, value, index)
+    elseif op == "length"
+        object = decode_batch_value(step["object"], bindings)
+        return length(object)
     elseif op == "iterate"
         object = decode_batch_value(step["object"], bindings)
         return collect_by_iteration(object)
+    elseif op == "identical"
+        object = decode_batch_value(step["object"], bindings)
+        other = decode_batch_value(step["other"], bindings)
+        return object === other
+    elseif op == "equal"
+        object = decode_batch_value(step["object"], bindings)
+        other = decode_batch_value(step["other"], bindings)
+        return object == other
+    elseif op == "introspect"
+        object = decode_batch_value(step["object"], bindings)
+        id = get(HANDLE_IDS, object, nothing)
+        id === nothing && (id = register_handle(object))
+        return object_introspection(id, object)
     elseif op == "result"
         return decode_batch_value(step["value"], bindings)
     end
@@ -440,8 +478,27 @@ function handle_request(op::String, payload::String)
             index = decode_value(request["index"])
             value, stdout_text, stderr_text = capture(() -> getindex(object, index))
             return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "setindex"
+            index = decode_value(request["index"])
+            new_value = decode_value(request["value"])
+            value, stdout_text, stderr_text = capture(() -> setindex!(object, new_value, index))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "length"
+            value, stdout_text, stderr_text = capture(() -> length(object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
         elseif object_op == "iterate"
             value, stdout_text, stderr_text = capture(() -> collect_by_iteration(object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "identical"
+            other = decode_value(request["other"])
+            value, stdout_text, stderr_text = capture(() -> object === other)
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "equal"
+            other = decode_value(request["other"])
+            value, stdout_text, stderr_text = capture(() -> object == other)
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "introspect"
+            value, stdout_text, stderr_text = capture(() -> object_introspection(request["id"]::Int, object))
             return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
         end
         error("unknown object operation: ", object_op)
@@ -452,9 +509,15 @@ function handle_request(op::String, payload::String)
     elseif op == "release"
         id = parse(Int, payload)
         if haskey(HANDLES, id)
-            value = HANDLES[id]
-            delete!(HANDLES, id)
-            delete!(HANDLE_IDS, value)
+            remaining = HANDLE_REFS[id] - 1
+            if remaining <= 0
+                value = HANDLES[id]
+                delete!(HANDLES, id)
+                delete!(HANDLE_IDS, value)
+                delete!(HANDLE_REFS, id)
+            else
+                HANDLE_REFS[id] = remaining
+            end
         end
         return ("", NOTHING_NODE, "", "")
     end

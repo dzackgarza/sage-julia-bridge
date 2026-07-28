@@ -358,10 +358,14 @@ class Issue11KernelCutoverRedProof(unittest.TestCase):
         cls.bridge.eval(
             """
 module Issue11FreshRuntime
-export Box, AffineCallable, box_value, same_object, explode_structured
+export Box, IndexedBox, AffineCallable, box_value, same_object, explode_structured
 
 mutable struct Box
     value::Int
+end
+
+mutable struct IndexedBox
+    values::Vector{Int}
 end
 
 struct AffineCallable
@@ -372,6 +376,11 @@ end
 (f::AffineCallable)(x) = f.scale * x + f.shift
 Base.getindex(box::Box, i::Int) = box.value + i
 Base.iterate(box::Box, state=1) = state > 3 ? nothing : (box.value + state, state + 1)
+Base.length(box::IndexedBox) = length(box.values)
+Base.getindex(box::IndexedBox, i::Int) = box.values[i]
+Base.setindex!(box::IndexedBox, value::Int, i::Int) = (box.values[i] = value; box)
+Base.iterate(box::IndexedBox, state=1) = state > length(box.values) ? nothing : (box.values[state], state + 1)
+Base.:(==)(left::IndexedBox, right::IndexedBox) = left.values == right.values
 box_value(box::Box) = box.value
 same_object(left, right) = left === right
 explode_structured(::Box) = throw(DomainError(:issue11_box, "structured backend failure witness"))
@@ -398,6 +407,28 @@ using .Issue11FreshRuntime
         self.assertEqual(box[ZZ(2)], ZZ(60))
         self.assertEqual(list(box), [ZZ(59), ZZ(60), ZZ(61)])
 
+    def test_fresh_runtime_type_supports_length_setindex_equality_and_introspection(self) -> None:
+        box, equal_box, distinct_box = self.bridge.sage("begin box = IndexedBox([4, 5, 6]); (box, IndexedBox([4, 5, 6]), IndexedBox([4, 5, 7])) end")
+
+        self.assertEqual(len(box), 3)
+        self.assertEqual(box[ZZ(2)], ZZ(5))
+        box[ZZ(2)] = ZZ(41)
+        self.assertEqual(list(box), [ZZ(4), ZZ(41), ZZ(6)])
+        self.assertFalse(box.backend_equals(equal_box))
+        self.assertFalse(box == equal_box)
+        self.assertFalse(box.backend_identical(equal_box))
+        self.assertFalse(box.backend_equals(distinct_box))
+
+        alias = self.bridge.call("identity", box)
+        self.assertTrue(box.backend_identical(alias))
+        self.assertTrue(box.backend_equals(alias))
+        description = box.introspect()
+        self.assertEqual(description["julia_type"], "IndexedBox")
+        self.assertEqual(description["length_applicable"], True)
+        self.assertEqual(description["iteration_applicable"], True)
+        self.assertEqual(description["indexing_applicable"], True)
+        self.assertGreaterEqual(description["retained_references"], ZZ(2))
+
     def test_nested_results_preserve_repeated_foreign_reference_identity(self) -> None:
         graph = self.bridge.sage("begin shared = Box(7); Any[shared, [shared, 11], (shared, shared)] end")
         first = graph[0]
@@ -408,6 +439,38 @@ using .Issue11FreshRuntime
         self.assertEqual(first.identity_key(), nested.identity_key())
         self.assertEqual(tuple_left.identity_key(), tuple_right.identity_key())
         self.assertTrue(self.bridge.call("same_object", first, tuple_left))
+
+    def test_release_reference_accounting_preserves_other_live_proxy(self) -> None:
+        with Julia() as bridge:
+            bridge.eval(
+                """
+module Issue11ReleaseRuntime
+export Box, box_value
+
+mutable struct Box
+    value::Int
+end
+
+box_value(box::Box) = box.value
+end
+using .Issue11ReleaseRuntime
+"""
+            )
+            first, second = bridge.sage("begin shared = Box(97); (shared, shared) end")
+
+            self.assertEqual(first.identity_key(), second.identity_key())
+            self.assertEqual(first.introspect()["retained_references"], ZZ(2))
+            first.release()
+            self.assertEqual(bridge.call("box_value", second), ZZ(97))
+            self.assertEqual(second.introspect()["retained_references"], ZZ(1))
+            with self.assertRaises(JuliaError) as released:
+                first.sage()
+            self.assertEqual(getattr(released.exception, "kind"), "released-object")
+            second.release()
+            second.release()
+            with self.assertRaises(JuliaError) as again_released:
+                second.getproperty("value")
+            self.assertEqual(getattr(again_released.exception, "kind"), "released-object")
 
     def test_conversion_refusal_leaves_foreign_object_usable(self) -> None:
         box = self.bridge.sage("Box(13)")
