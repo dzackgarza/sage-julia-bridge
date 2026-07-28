@@ -673,6 +673,38 @@ using .Issue11RestartRuntime
         with self.assertRaises(ZeroDivisionError):
             iota(circle).inverse()
 
+    def test_integer_prime_localization_uses_retained_oscar_local_ring(self) -> None:
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+
+        L, iota = prime_localization(ZZ, ZZ.ideal(5))
+        maximal = L.maximal_ideal()
+        residue_field, rho = L.residue_field()
+
+        two = iota(ZZ(2))
+        five = iota(ZZ(5))
+
+        self.assertIs(two.parent(), L)
+        self.assertTrue(two.is_unit())
+        self.assertFalse(five.is_unit())
+        self.assertEqual(two * two.inverse(), L(1))
+        self.assertTrue(five in maximal)
+        self.assertFalse(two in maximal)
+        self.assertEqual(maximal.gens(), (five,))
+        self.assertEqual(rho(two), residue_field(2))
+        self.assertEqual(rho(five), residue_field.zero())
+        self.assertEqual(residue_field.order(), ZZ(5))
+        self.assertEqual(iota.oscar().getproperty("domain"), ZZ)
+        self.assertEqual(iota.oscar().getproperty("codomain").base_ring(), ZZ)
+        self.assertEqual(L.oscar().base_ring(), ZZ)
+        self.assertTrue(two.oscar().backend_equals(iota.oscar()(ZZ(2))))
+
+        with self.assertRaises(ZeroDivisionError):
+            L(ZZ(1), ZZ(5))
+        with self.assertRaises(ZeroDivisionError):
+            five.inverse()
+
 
 class Issue11GenericOscarSentinelTest(unittest.TestCase):
     """Cross-domain proof that the core object runtime is not ring-shaped."""

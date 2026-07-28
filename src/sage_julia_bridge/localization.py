@@ -239,6 +239,17 @@ def prime_localization(base: Any, prime: Any) -> tuple[PrimeLocalizationParent, 
         raise TypeError("prime ideal must belong to the given base ring")
 
     julia.eval("using Oscar")
+    from sage.all import ZZ
+
+    if base is ZZ:
+        prime_generators = list(prime.gens())
+        if len(prime_generators) != 1:
+            raise ValueError("ZZ prime localization requires one principal generator")
+        oscar_ring = julia.call("localization", base, prime_generators[0])
+        oscar_iota = julia.call("BridgeCoercionMap", base, oscar_ring)
+        localization = PrimeLocalizationParent(base, prime, oscar_ring, oscar_iota)
+        return localization, PrimeLocalizationMap(base, localization, oscar_iota)
+
     oscar_prime = julia.call("ideal", base, list(prime.gens()))
     oscar_units = julia.call("complement_of_prime_ideal", oscar_prime, check=False)
     oscar_ring, oscar_iota = julia.call("localization", base, oscar_units)

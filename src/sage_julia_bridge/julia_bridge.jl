@@ -18,6 +18,13 @@ const BRIDGE_CAPABILITIES = [
     "conversion.mrdi",
 ]
 
+struct BridgeCoercionMap
+    domain
+    codomain
+end
+
+(map::BridgeCoercionMap)(value) = map.codomain(value)
+
 function json_escape(s::AbstractString)
     io = IOBuffer()
     for c in s
