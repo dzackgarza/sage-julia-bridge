@@ -29,7 +29,8 @@ from sage.rings.integer_ring import ZZ
 from sage.rings.rational_field import QQ
 from sage.structure.element import Matrix, Vector
 
-from sage_julia_bridge.errors import JuliaError, JuliaProtocolError
+from sage_julia_bridge.conversion import ConversionRegistry
+from sage_julia_bridge.errors import JuliaConversionError, JuliaError, JuliaProtocolError
 from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
 
 type StructuredValue = dict[str, Any]
@@ -53,7 +54,7 @@ class JuliaHandle:
 
     Returned by sage()/call() for values the structured codec does not cover.
     Handles are valid as set()/call() inputs; sage() attempts explicit
-    materialization and raises TypeError if the value is still uncovered.
+    materialization and raises JuliaConversionError if the value is still uncovered.
     """
 
     def __init__(self, bridge: Julia, handle_id: int, julia_type: str, display: str) -> None:
@@ -86,8 +87,13 @@ class JuliaHandle:
         )
         return self._bridge._decode_value(response.structured, response.display)
 
-    def sage(self) -> Any:
+    def julia_type(self) -> str:
+        return self._julia_type
+
+    def sage(self, target: object | None = None) -> Any:
         self._assert_current()
+        if target is not None:
+            return self._bridge.conversions.convert_to_sage(self, target)
         response = self._bridge._request("materialize", str(self._id))
         return self._bridge._decode_value(response.structured, response.display)
 
@@ -171,6 +177,7 @@ class Julia:
         self._stderr_thread: threading.Thread | None = None
         self._pending_releases: deque[int] = deque()
         self._generation = 0
+        self.conversions = ConversionRegistry()
 
     def __repr__(self) -> str:
         return "Julia"
@@ -330,6 +337,9 @@ class Julia:
         return "\n".join(parts)
 
     def _encode_value(self, value: object) -> StructuredValue:
+        return self.conversions.encode_to_julia(value, self._encode_builtin_value)
+
+    def _encode_builtin_value(self, value: object) -> StructuredValue:
         if value is None:
             return {"type": "nothing"}
         if isinstance(value, bool):
@@ -401,8 +411,8 @@ class Julia:
             return JuliaHandle(self, data["id"], data["julia_type"], data["display"])
         if kind == "unsupported":
             julia_type = data["julia_type"]
-            msg = f"cannot convert Julia value of type {julia_type} to Sage; use eval(...) instead\n{display}"
-            raise TypeError(msg)
+            msg = f"cannot convert Julia value of type {julia_type} to Sage; the retained foreign object remains usable\n{display}"
+            raise JuliaConversionError(msg, julia_type=julia_type)
         raise JuliaProtocolError(f"unknown Julia value type: {kind!r}")
 
     def eval(self, code: str) -> str:

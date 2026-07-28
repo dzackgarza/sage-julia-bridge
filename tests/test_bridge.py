@@ -7,6 +7,7 @@ from sage.all import QQ, ZZ, matrix, vector
 
 from sage_julia_bridge import (
     Julia,
+    JuliaConversionError,
     JuliaError,
     JuliaHandle,
     JuliaProtocolError,
@@ -409,9 +410,36 @@ using .Issue11FreshRuntime
     def test_conversion_refusal_leaves_foreign_object_usable(self) -> None:
         box = self.bridge.sage("Box(13)")
 
-        with self.assertRaises(TypeError):
+        with self.assertRaises(JuliaConversionError) as raised:
             box.sage()
+        self.assertEqual(getattr(raised.exception, "kind"), "conversion-refused")
+        self.assertEqual(getattr(raised.exception, "backend_type"), "Box")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(13))
+
+    def test_target_directed_sage_conversion_registry(self) -> None:
+        target = ("issue-11", "box-value")
+
+        self.bridge.conversions.register_to_sage(target, lambda handle: handle.getproperty("value"))
+        box = self.bridge.sage("Box(19)")
+
+        self.assertEqual(box.sage(target), ZZ(19))
+        with self.assertRaises(JuliaConversionError) as raised:
+            box.sage(("issue-11", "unregistered"))
+        self.assertEqual(getattr(raised.exception, "kind"), "conversion-refused")
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(19))
+
+    def test_outbound_conversion_registry_is_recursive(self) -> None:
+        class RuntimeInt:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+        self.bridge.conversions.register_to_julia(
+            lambda value: isinstance(value, RuntimeInt),
+            lambda value, _encode: {"type": "int", "value": str(value.value)} if isinstance(value, RuntimeInt) else None,
+        )
+
+        self.assertEqual(self.bridge.call("+", RuntimeInt(8), ZZ(5)), ZZ(13))
+        self.assertEqual(self.bridge.call("sum", [RuntimeInt(2), RuntimeInt(3), ZZ(5)]), ZZ(10))
 
     def test_backend_failures_are_structured_and_do_not_poison_worker(self) -> None:
         box = self.bridge.sage("Box(23)")

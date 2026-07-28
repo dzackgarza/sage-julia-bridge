@@ -22,3 +22,19 @@ class JuliaError(RuntimeError):
 
 class JuliaProtocolError(JuliaError):
     """Raised when data crossing the bridge violates the wire format."""
+
+
+class JuliaConversionError(JuliaError, TypeError):
+    """Raised when explicit Sage/Julia conversion is refused."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        target: object | None = None,
+        julia_type: str | None = None,
+        kind: str = "conversion-refused",
+    ) -> None:
+        super().__init__(message, kind=kind, backend_type=julia_type)
+        self.target = target
+        self.julia_type = julia_type
