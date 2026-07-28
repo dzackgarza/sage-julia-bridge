@@ -636,6 +636,43 @@ using .Issue11RestartRuntime
             L(S.gen(0))
         self.assertEqual(getattr(constructor_raised.exception, "kind"), "parent-incompatible")
 
+    def test_noncoordinate_prime_localization_residue_and_ideal_workflow(self) -> None:
+        from sage.all import PolynomialRing
+
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+        circle = x**2 + y**2 - 1
+        prime = R.ideal([circle])
+        L, iota = prime_localization(R, prime)
+        maximal = L.maximal_ideal()
+        residue_field, rho = L.residue_field()
+        quotient = R.quotient(prime)
+
+        y_local = iota(y)
+        local_fraction = L(x + y, y)
+
+        self.assertTrue(prime.is_prime())
+        self.assertTrue(y_local.is_unit())
+        self.assertEqual(y_local * y_local.inverse(), L(1))
+        self.assertTrue(iota(circle) in maximal)
+        self.assertTrue(maximal.is_maximal())
+        self.assertIs(maximal.quotient(), residue_field)
+        self.assertIs(L.quotient(maximal), residue_field)
+        self.assertEqual(L.fraction_field(), R.fraction_field())
+        self.assertEqual(local_fraction * y_local, iota(x + y))
+        self.assertEqual(rho(iota(circle)), residue_field.zero())
+        self.assertEqual(rho(local_fraction), residue_field(quotient(x + y)) / residue_field(quotient(y)))
+        self.assertTrue(local_fraction.oscar().backend_equals(iota.oscar()(x + y) / iota.oscar()(y)))
+
+        with self.assertRaises(ZeroDivisionError):
+            L(x, circle)
+        with self.assertRaises(ZeroDivisionError):
+            iota(circle).inverse()
+
 
 class Issue11GenericOscarSentinelTest(unittest.TestCase):
     """Cross-domain proof that the core object runtime is not ring-shaped."""

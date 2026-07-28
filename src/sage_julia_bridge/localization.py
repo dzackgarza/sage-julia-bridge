@@ -50,6 +50,14 @@ class PrimeLocalizationElement(Element):
     def is_unit(self) -> bool:
         return self._numerator not in self.parent()._prime
 
+    def inverse(self) -> PrimeLocalizationElement:
+        if not self.is_unit():
+            raise ZeroDivisionError("nonunit prime-local element is not invertible")
+        return cast(PrimeLocalizationElement, self.parent()(self._denominator, self._numerator))
+
+    def __invert__(self) -> PrimeLocalizationElement:
+        return self.inverse()
+
     def _add_(self, other: PrimeLocalizationElement) -> PrimeLocalizationElement:
         parent = self.parent()
         numerator = self._numerator * other._denominator + other._numerator * self._denominator
@@ -70,6 +78,9 @@ class PrimeLocalizationElement(Element):
             self.parent()(self._numerator * rhs._denominator, self._denominator * rhs._numerator),
         )
 
+    def __rtruediv__(self, other: Any) -> PrimeLocalizationElement:
+        return cast(PrimeLocalizationElement, self.parent()(other) / self)
+
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PrimeLocalizationElement):
             return False
@@ -82,12 +93,25 @@ class PrimeLocalizationIdeal:
     def __init__(self, ring: PrimeLocalizationParent, generators: list[Any]) -> None:
         self._ring = ring
         self._generators = tuple(ring(generator) for generator in generators)
+        self._base_ideal = ring._base.ideal([generator.numerator() for generator in self._generators])
 
     def ring(self) -> PrimeLocalizationParent:
         return self._ring
 
     def gens(self) -> tuple[PrimeLocalizationElement, ...]:
         return self._generators
+
+    def is_maximal(self) -> bool:
+        return self == self._ring.maximal_ideal()
+
+    def quotient(self) -> Any:
+        return self._ring.quotient(self)
+
+    def __contains__(self, value: Any) -> bool:
+        element = self._ring(value)
+        if self.is_maximal():
+            return element.numerator() in self._ring._prime
+        return element.numerator() in self._base_ideal
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, PrimeLocalizationIdeal) and self._ring is other._ring and self._generators == other._generators
@@ -109,6 +133,7 @@ class PrimeLocalizationParent(Parent):
         self._oscar_iota = oscar_iota
         self._fraction_field = base.fraction_field()
         self._maximal_ideal = PrimeLocalizationIdeal(self, list(prime.gens()))
+        self._residue_field_data: tuple[Any, PrimeLocalizationResidueMap] | None = None
 
     def _repr_(self) -> str:
         return f"{self._base} localized at {self._prime}"
@@ -154,10 +179,27 @@ class PrimeLocalizationParent(Parent):
     def maximal_ideal(self) -> PrimeLocalizationIdeal:
         return self._maximal_ideal
 
+    def fraction_field(self) -> Any:
+        return self._fraction_field
+
+    def quotient(self, ideal: PrimeLocalizationIdeal) -> Any:
+        if ideal.ring() is not self:
+            raise JuliaConversionError(
+                "cannot quotient a prime localization by an ideal over another parent",
+                target=self,
+                kind="parent-incompatible",
+            )
+        if ideal == self.maximal_ideal():
+            return self.residue_field()[0]
+        raise NotImplementedError("only the maximal ideal quotient is currently implemented")
+
     def residue_field(self) -> tuple[Any, PrimeLocalizationResidueMap]:
+        if self._residue_field_data is not None:
+            return self._residue_field_data
         quotient = self._base.quotient(self._prime)
         field = quotient.fraction_field()
-        return field, PrimeLocalizationResidueMap(self, field, quotient)
+        self._residue_field_data = (field, PrimeLocalizationResidueMap(self, field, quotient))
+        return self._residue_field_data
 
 
 class PrimeLocalizationMap(SageOscarRealizationMap):
