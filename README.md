@@ -1,37 +1,39 @@
 # sage-julia-bridge
 
-`sage-julia-bridge` is a standalone Python package for Sage that talks to a long-lived Julia subprocess over stdio.
-It does not patch or modify Sage's source tree.
+`sage-julia-bridge` connects Sage to a retained Julia/Oscar object session over a versioned subprocess protocol.
+It installs as a standalone Sage package and does not patch Sage.
 
-The bridge is intentionally small:
+Every Julia result remains usable, including package-defined types unknown to the bridge.
+`JuliaHandle` is a live foreign object with backend identity, calls, properties, mutation, indexing, containment, iteration, equality, introspection, and deterministic release.
+Nested results preserve repeated references.
+Structured batches compose several backend operations in one subprocess request.
 
-- evaluate Julia code as strings
+Native conversion is separate from foreign-object use.
+Value-like integers, rationals, finite-field elements, polynomials, vectors, and matrices convert automatically when the pinned MRDI conversion supports them.
+Identity-bearing parents and maps remain retained by default.
+Call `.sage()` for explicit conversion; typed refusal leaves the foreign object usable.
+Conversion registries extend both directions without changing the object runtime.
 
-- keep one Julia session alive
+The first native Sage facade is prime localization:
 
-- convert a small set of common values between Julia and Sage
+```python
+from sage.all import GF, QQ, PolynomialRing
+from sage_julia_bridge import prime_localization
 
-- let Sage load Julia packages such as Oscar out of process
+R = PolynomialRing(QQ, ("x", "y"), order="degrevlex")
+x, y = R.gens()
+L, iota = prime_localization(R, R.ideal(x))
+m = L.maximal_ideal()
+k, rho = L.residue_field()
 
-Supported structured conversions (both directions, parent-aware — see `docs/wire-format.md` for the pinned grammar):
+assert not iota(x).is_unit()
+assert iota(y).is_unit()
+assert rho(iota(x)) == k.zero()
+assert iota(x) in m
+```
 
-- integers, rationals, strings, booleans, `None` / `nothing`
-
-- lists/tuples (containers stay containers)
-
-- `Zmod(n)`, `GF(p)`, and `GF(p^n)` with its explicit defining modulus
-
-- univariate and multivariate polynomial rings over the supported bases (multivariate rings are identified with degrevlex order; other Sage term orders are rejected on input)
-
-- matrices over every supported base ring, including zero matrices
-
-- the parent rings themselves (e.g. passing Sage `ZZ` or `GF(7)` to `call`)
-
-Elements decoded from one Julia session share reconstructed parents, so arithmetic between round-tripped values works on both sides.
-
-`set(...)` and `call(...)` are protocol operations: values travel as data and are never interpolated into Julia source.
-Any result outside the conversions above comes back from `sage(...)`/`call(...)` as an opaque `JuliaHandle`, which can be passed back into `set`/`call` and materialized explicitly with `.sage()` (raising `TypeError` if still unsupported).
-Inputs outside the codec (e.g. floats, dicts) are rejected loudly; use `eval(...)` with Julia source for anything else.
+`L`, its elements and ideals, `iota`, `k`, and `rho` are native Sage parents, elements, ideals, fields, and ring morphisms.
+Each facade exposes its retained backend realization through `.oscar()`.
 
 ## Install
 
@@ -63,6 +65,21 @@ end"""))
 
 julia.quit()
 ```
+
+Obtain global modules, functions, and constructors without evaluating source:
+
+```python
+julia.eval("using Oscar")
+oscar = julia.resolve("Oscar")
+matrix_algebra = oscar.getproperty("matrix_algebra")
+A = matrix_algebra(QQ, 2)
+assert julia.call("dimension", A) == 4
+```
+
+`eval(...)` remains an explicit expert escape hatch.
+Normal object composition, conversion, and localization do not interpolate values into Julia source.
+
+See [the wire and object protocol](docs/wire-format.md) for framing, conversion policy, lifecycle, batching, and error contracts.
 
 You can also create isolated sessions:
 

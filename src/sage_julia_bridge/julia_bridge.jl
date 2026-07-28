@@ -1,6 +1,35 @@
 using Base64
 import JSON
 
+for adapter in filter(path -> endswith(path, "_backend.jl"), readdir(@__DIR__; join=true))
+    include(adapter)
+end
+
+const BRIDGE_PROTOCOL_VERSION = 1
+const BRIDGE_CAPABILITIES = [
+    "transport.structured-errors",
+    "runtime.retained-objects",
+    "runtime.call-object",
+    "runtime.properties",
+    "runtime.indexing",
+    "runtime.containment",
+    "runtime.iteration",
+    "runtime.length",
+    "runtime.identity",
+    "runtime.equality",
+    "runtime.introspection",
+    "runtime.release",
+    "runtime.batch",
+    "conversion.mrdi",
+]
+
+struct BridgeCoercionMap
+    domain
+    codomain
+end
+
+(map::BridgeCoercionMap)(value) = map.codomain(value)
+
 function json_escape(s::AbstractString)
     io = IOBuffer()
     for c in s
@@ -40,10 +69,10 @@ json_string(s::AbstractString) = "\"" * json_escape(s) * "\""
 function nemo_to_base(x)
     Nemo = parentmodule(typeof(x))
     nameof(Nemo) === :Nemo || return nothing
-    x isa Nemo.ZZRingElem && return BigInt(x)
-    x isa Nemo.QQFieldElem && return Rational{BigInt}(x)
-    x isa Nemo.ZZMatrix && return Matrix{BigInt}(x)
-    x isa Nemo.QQMatrix && return Matrix{Rational{BigInt}}(x)
+    x isa Nemo.ZZRingElem && return Base.invokelatest(BigInt, x)
+    x isa Nemo.QQFieldElem && return Base.invokelatest(Rational{BigInt}, x)
+    x isa Nemo.ZZMatrix && return Base.invokelatest(Matrix{BigInt}, x)
+    x isa Nemo.QQMatrix && return Base.invokelatest(Matrix{Rational{BigInt}}, x)
     return nothing
 end
 
@@ -92,11 +121,20 @@ end
 # Opaque references to worker-held values the structured codec does not
 # cover. Keyed by a monotone id; entries live until the client releases them.
 const HANDLES = Dict{Int,Any}()
+const HANDLE_IDS = IdDict{Any,Int}()
+const HANDLE_REFS = Dict{Int,Int}()
 const HANDLE_COUNTER = Ref(0)
 
 function register_handle(x)
+    existing = get(HANDLE_IDS, x, nothing)
+    if existing !== nothing
+        HANDLE_REFS[existing] = HANDLE_REFS[existing] + 1
+        return existing
+    end
     id = (HANDLE_COUNTER[] += 1)
     HANDLES[id] = x
+    HANDLE_IDS[x] = id
+    HANDLE_REFS[id] = 1
     return id
 end
 
@@ -109,6 +147,10 @@ const MRDI_WHITELIST = Set([
     "PolyRing", "PolyRingElem", "MPolyRing", "MPolyRingElem",
     "MatSpace", "MatElem",
     "Vector", "Tuple",
+])
+const MRDI_RETAINED_ROOTS = Set([
+    "ZZRing", "QQField", "Nemo.zzModRing", "Nemo.ZZModRing",
+    "FiniteField", "PolyRing", "MPolyRing", "MatSpace",
 ])
 
 function walk_type_names!(names::Vector{String}, node, in_type::Bool)
@@ -149,7 +191,16 @@ end
 # inside the pinned subset; nothing means the value takes the handle tier
 # (either Oscar is absent, Oscar cannot serialize it, or a type falls
 # outside the whitelist).
-function try_mrdi(x)
+function mrdi_root_name(doc)
+    root = doc["_type"]
+    root isa AbstractString && return root
+    root isa AbstractDict || return nothing
+    haskey(root, "name") || return nothing
+    name = root["name"]
+    return name isa AbstractString ? name : nothing
+end
+
+function try_mrdi(x; retain_identity::Bool)
     isdefined(Main, :Oscar) || return nothing
     io = IOBuffer()
     try
@@ -161,15 +212,45 @@ function try_mrdi(x)
     doc = JSON.parse(raw)
     names = walk_type_names!(String[], doc, false)
     issubset(Set(names), MRDI_WHITELIST) || return nothing
+    retain_identity && mrdi_root_name(doc) in MRDI_RETAINED_ROOTS && return nothing
     return "{\"type\":\"mrdi\",\"data\":" * raw * "}"
 end
 
 # wrap=true: uncovered values become handles (sage()/call() results).
 # wrap=false: uncovered values report unsupported (explicit materialization).
 function encode_value(x, wrap::Bool)
+    converted = nemo_to_base(x)
+    converted === nothing || return encode_value(converted, wrap)
+    if x === nothing
+        return "{\"type\":\"nothing\"}"
+    elseif x isa Bool
+        return "{\"type\":\"bool\",\"value\":" * (x ? "true" : "false") * "}"
+    elseif x isa AbstractString
+        return "{\"type\":\"string\",\"value\":" * json_string(x) * "}"
+    elseif x isa Integer
+        return "{\"type\":\"int\",\"value\":" * json_string(string(x)) * "}"
+    elseif x isa Rational
+        return (
+            "{\"type\":\"rational\",\"num\":" * json_string(string(numerator(x))) *
+            ",\"den\":" * json_string(string(denominator(x))) * "}"
+        )
+    elseif x isa Tuple
+        values = String[encode_value(item, wrap) for item in x]
+        return "{\"type\":\"vector\",\"data\":[" * join(values, ",") * "]}"
+    elseif x isa AbstractVector
+        values = String[encode_value(item, wrap) for item in x]
+        return "{\"type\":\"vector\",\"data\":[" * join(values, ",") * "]}"
+    elseif x isa AbstractMatrix
+        values = String[encode_value(x[i, j], wrap) for i in axes(x, 1) for j in axes(x, 2)]
+        return (
+            "{\"type\":\"matrix\",\"nrows\":" * string(size(x, 1)) *
+            ",\"ncols\":" * string(size(x, 2)) *
+            ",\"data\":[" * join(values, ",") * "]}"
+        )
+    end
     encoded = encode_supported(x)
     encoded === nothing || return encoded
-    encoded = try_mrdi(x)
+    encoded = try_mrdi(x; retain_identity=wrap)
     encoded === nothing || return encoded
     if !wrap
         return "{\"type\":\"unsupported\",\"julia_type\":" * json_string(string(typeof(x))) * "}"
@@ -180,6 +261,11 @@ function encode_value(x, wrap::Bool)
         ",\"julia_type\":" * json_string(string(typeof(x))) *
         ",\"display\":" * json_string(display_text(x)) * "}"
     )
+end
+
+function lookup_handle(id::Int)
+    haskey(HANDLES, id) || error("unknown handle id: ", id)
+    return HANDLES[id]
 end
 
 function decode_value(node::AbstractDict)
@@ -208,8 +294,7 @@ function decode_value(node::AbstractDict)
         return [decode_value(data[(i - 1) * ncols + j]) for i in 1:nrows, j in 1:ncols]
     elseif kind == "handle"
         id = node["id"]::Int
-        haskey(HANDLES, id) || error("unknown handle id: ", id)
-        return HANDLES[id]
+        return lookup_handle(id)
     elseif kind == "mrdi"
         isdefined(Main, :Oscar) ||
             error("mrdi payload requires Oscar; run eval(\"using Oscar\") first")
@@ -218,6 +303,25 @@ function decode_value(node::AbstractDict)
         return Main.Oscar.load(IOBuffer(JSON.json(doc)))
     end
     error("unknown bridge value type: ", kind)
+end
+
+function decode_batch_value(node::AbstractDict, bindings::Dict{String,Any})
+    kind = node["type"]::String
+    if kind == "batch_ref"
+        name = node["name"]::String
+        haskey(bindings, name) || error("unknown batch reference: ", name)
+        return bindings[name]
+    elseif kind == "vector"
+        return [decode_batch_value(item, bindings) for item in node["data"]]
+    elseif kind == "matrix"
+        nrows = node["nrows"]::Int
+        ncols = node["ncols"]::Int
+        data = node["data"]
+        length(data) == nrows * ncols ||
+            error("matrix payload has ", length(data), " entries for ", nrows, "x", ncols)
+        return [decode_batch_value(data[(i - 1) * ncols + j], bindings) for i in 1:nrows, j in 1:ncols]
+    end
+    return decode_value(node)
 end
 
 # Values are never interpolated into source: a function path is resolved as a
@@ -270,6 +374,99 @@ function evaluate(code::AbstractString)
     return capture(() -> Base.include_string(Main, code, "sage_julia_bridge"))
 end
 
+function collect_by_iteration(x)
+    values = Any[]
+    next = iterate(x)
+    while next !== nothing
+        value, state = next
+        push!(values, value)
+        next = iterate(x, state)
+    end
+    return values
+end
+
+function object_introspection(id::Int, x)
+    return Any[
+        ("id", id),
+        ("julia_type", string(typeof(x))),
+        ("display", display_text(x)),
+        ("retained_references", HANDLE_REFS[id]),
+        ("length_applicable", applicable(length, x)),
+        ("iteration_applicable", applicable(iterate, x)),
+        ("indexing_applicable", applicable(getindex, x, 1)),
+    ]
+end
+
+function execute_batch_step(step::AbstractDict, bindings::Dict{String,Any})
+    op = step["op"]::String
+    if op == "call"
+        f = resolve_path(step["function"]::String)
+        args = Any[decode_batch_value(item, bindings) for item in step["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_batch_value(item, bindings) for (key, item) in step["kwargs"]]
+        return f(args...; kwargs...)
+    elseif op == "call_object"
+        f = decode_batch_value(step["function"], bindings)
+        args = Any[decode_batch_value(item, bindings) for item in step["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_batch_value(item, bindings) for (key, item) in step["kwargs"]]
+        return f(args...; kwargs...)
+    elseif op == "getproperty"
+        object = decode_batch_value(step["object"], bindings)
+        return getproperty(object, Symbol(step["name"]::String))
+    elseif op == "setproperty"
+        object = decode_batch_value(step["object"], bindings)
+        value = decode_batch_value(step["value"], bindings)
+        return setproperty!(object, Symbol(step["name"]::String), value)
+    elseif op == "getindex"
+        object = decode_batch_value(step["object"], bindings)
+        index = decode_batch_value(step["index"], bindings)
+        return getindex(object, index)
+    elseif op == "setindex"
+        object = decode_batch_value(step["object"], bindings)
+        index = decode_batch_value(step["index"], bindings)
+        value = decode_batch_value(step["value"], bindings)
+        return setindex!(object, value, index)
+    elseif op == "length"
+        object = decode_batch_value(step["object"], bindings)
+        return length(object)
+    elseif op == "iterate"
+        object = decode_batch_value(step["object"], bindings)
+        return collect_by_iteration(object)
+    elseif op == "contains"
+        object = decode_batch_value(step["object"], bindings)
+        value = decode_batch_value(step["value"], bindings)
+        return in(value, object)
+    elseif op == "identical"
+        object = decode_batch_value(step["object"], bindings)
+        other = decode_batch_value(step["other"], bindings)
+        return object === other
+    elseif op == "equal"
+        object = decode_batch_value(step["object"], bindings)
+        other = decode_batch_value(step["other"], bindings)
+        return object == other
+    elseif op == "introspect"
+        object = decode_batch_value(step["object"], bindings)
+        id = get(HANDLE_IDS, object, nothing)
+        id === nothing && (id = register_handle(object))
+        return object_introspection(id, object)
+    elseif op == "result"
+        return decode_batch_value(step["value"], bindings)
+    end
+    error("unknown batch operation: ", op)
+end
+
+function execute_batch(steps)
+    bindings = Dict{String,Any}()
+    last_value = nothing
+    for step in steps
+        value = execute_batch_step(step, bindings)
+        if haskey(step, "bind")
+            bindings[step["bind"]::String] = value
+        end
+        last_value = value
+    end
+    return last_value
+end
+
 function reply(parts::Vector{String})
     println(stdout, join(parts, '\t'))
     flush(stdout)
@@ -277,13 +474,26 @@ end
 
 const NOTHING_NODE = "{\"type\":\"nothing\"}"
 
+function hello_payload()
+    return JSON.json(Dict(
+        "protocol_version" => BRIDGE_PROTOCOL_VERSION,
+        "capabilities" => BRIDGE_CAPABILITIES,
+    ))
+end
+
 # Returns (display, structured, stdout, stderr) for the ok reply.
 function handle_request(op::String, payload::String)
-    if op == "exec"
+    if op == "hello"
+        payload = hello_payload()
+        return (payload, "{\"type\":\"string\",\"value\":" * json_string(payload) * "}", "", "")
+    elseif op == "exec"
         value, stdout_text, stderr_text = evaluate(payload)
         return (display_text(value), NOTHING_NODE, stdout_text, stderr_text)
     elseif op == "value"
         value, stdout_text, stderr_text = evaluate(payload)
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "resolve"
+        value, stdout_text, stderr_text = capture(() -> resolve_path(payload))
         return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
     elseif op == "set"
         request = JSON.parse(payload)
@@ -302,15 +512,77 @@ function handle_request(op::String, payload::String)
         kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
         value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))
         return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "call_object"
+        request = JSON.parse(payload)
+        f = decode_value(request["function"])
+        args = Any[decode_value(item) for item in request["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
+        value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "batch"
+        request = JSON.parse(payload)
+        value, stdout_text, stderr_text = capture(() -> execute_batch(request["steps"]))
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "object"
+        request = JSON.parse(payload)
+        object_op = request["op"]::String
+        object = lookup_handle(request["id"]::Int)
+        if object_op == "getproperty"
+            value, stdout_text, stderr_text = capture(() -> getproperty(object, Symbol(request["name"]::String)))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "setproperty"
+            new_value = decode_value(request["value"])
+            value, stdout_text, stderr_text = capture(() -> setproperty!(object, Symbol(request["name"]::String), new_value))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "getindex"
+            index = decode_value(request["index"])
+            value, stdout_text, stderr_text = capture(() -> getindex(object, index))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "setindex"
+            index = decode_value(request["index"])
+            new_value = decode_value(request["value"])
+            value, stdout_text, stderr_text = capture(() -> setindex!(object, new_value, index))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "length"
+            value, stdout_text, stderr_text = capture(() -> length(object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "iterate"
+            value, stdout_text, stderr_text = capture(() -> collect_by_iteration(object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "contains"
+            value_node = request["value"]
+            value, stdout_text, stderr_text = capture(() -> in(decode_value(value_node), object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "identical"
+            other = decode_value(request["other"])
+            value, stdout_text, stderr_text = capture(() -> object === other)
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "equal"
+            other = decode_value(request["other"])
+            value, stdout_text, stderr_text = capture(() -> object == other)
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "introspect"
+            value, stdout_text, stderr_text = capture(() -> object_introspection(request["id"]::Int, object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        end
+        error("unknown object operation: ", object_op)
     elseif op == "materialize"
         id = parse(Int, payload)
-        haskey(HANDLES, id) || error("unknown handle id: ", id)
-        x = HANDLES[id]
+        x = lookup_handle(id)
         return (display_text(x), encode_value(x, false), "", "")
     elseif op == "release"
         id = parse(Int, payload)
-        haskey(HANDLES, id) || error("unknown handle id: ", id)
-        delete!(HANDLES, id)
+        if haskey(HANDLES, id)
+            remaining = HANDLE_REFS[id] - 1
+            if remaining <= 0
+                value = HANDLES[id]
+                delete!(HANDLES, id)
+                delete!(HANDLE_IDS, value)
+                delete!(HANDLE_REFS, id)
+            else
+                HANDLE_REFS[id] = remaining
+            end
+        end
         return ("", NOTHING_NODE, "", "")
     end
     error("unknown bridge operation: ", op)
@@ -343,6 +615,13 @@ for line in eachline(stdin)
         ])
     catch ex
         message = sprint(io -> showerror(io, ex, catch_backtrace()))
-        reply(["err", b64(message), b64(""), b64("")])
+        payload = (
+            "{\"type\":\"julia_error\",\"kind\":\"backend\",\"backend_type\":" *
+            json_string(string(nameof(typeof(ex)))) *
+            ",\"message\":" * json_string(message) *
+            ",\"backend_stack\":" * json_string(sprint(io -> show(io, catch_backtrace()))) *
+            "}"
+        )
+        reply(["err", b64(payload), b64(""), b64("")])
     end
 end

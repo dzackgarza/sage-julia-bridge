@@ -16,7 +16,10 @@ import shlex
 import shutil
 import subprocess
 import threading
+import uuid
 from collections import deque
+from collections.abc import Iterator
+from dataclasses import dataclass
 from numbers import Integral, Rational
 from pathlib import Path
 from typing import Any
@@ -27,12 +30,35 @@ from sage.rings.integer_ring import ZZ
 from sage.rings.rational_field import QQ
 from sage.structure.element import Matrix, Vector
 
-from sage_julia_bridge.errors import JuliaError, JuliaProtocolError
+from sage_julia_bridge.conversion import ConversionRegistry
+from sage_julia_bridge.errors import (
+    JuliaConversionError,
+    JuliaDispatchError,
+    JuliaError,
+    JuliaProtocolError,
+    JuliaReleasedObjectError,
+    JuliaStaleObjectError,
+    JuliaWorkerError,
+)
 from sage_julia_bridge.mrdi import decode_mrdi, encode_mrdi
 
 type StructuredValue = dict[str, Any]
 
 _JULIA_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
+BRIDGE_PROTOCOL_VERSION = 1
+
+
+@dataclass(frozen=True)
+class JuliaBatchRef:
+    """Reference to a named intermediate value in a structured batch."""
+
+    name: str
+
+
+def batch_ref(name: str) -> JuliaBatchRef:
+    """Create a reference to a named value inside ``Julia.batch``."""
+
+    return JuliaBatchRef(name)
 
 
 class BridgeResponse(BaseModel):
@@ -51,7 +77,7 @@ class JuliaHandle:
 
     Returned by sage()/call() for values the structured codec does not cover.
     Handles are valid as set()/call() inputs; sage() attempts explicit
-    materialization and raises TypeError if the value is still uncovered.
+    materialization and raises JuliaConversionError if the value is still uncovered.
     """
 
     def __init__(self, bridge: Julia, handle_id: int, julia_type: str, display: str) -> None:
@@ -60,6 +86,7 @@ class JuliaHandle:
         self._generation = bridge._generation
         self._julia_type = julia_type
         self._display = display
+        self._released = False
 
     def __repr__(self) -> str:
         return f"JuliaHandle<{self._julia_type}>({self._display})"
@@ -67,18 +94,138 @@ class JuliaHandle:
     def _assert_current(self) -> None:
         # Ids restart with each worker process; a stale id would silently
         # resolve to a different object in the new worker's table.
-        assert self._generation == self._bridge._generation, f"stale handle from a previous Julia worker: {self!r}"
+        if self._generation != self._bridge._generation:
+            raise JuliaStaleObjectError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
+        if self._released:
+            raise JuliaReleasedObjectError(f"released Julia handle cannot be used: {self!r}", kind="released-object")
 
-    def sage(self) -> Any:
+    def _operation(self, operation: str, **payload: object) -> Any:
         self._assert_current()
+        response = self._bridge._request(
+            "object",
+            json.dumps(
+                {
+                    "op": operation,
+                    "id": self._id,
+                    **payload,
+                }
+            ),
+        )
+        return self._bridge._decode_value(response.structured, response.display)
+
+    def julia_type(self) -> str:
+        return self._julia_type
+
+    def sage(self, target: object | None = None) -> Any:
+        self._assert_current()
+        if target is not None:
+            return self._bridge.conversions.convert_to_sage(self, target)
         response = self._bridge._request("materialize", str(self._id))
         return self._bridge._decode_value(response.structured, response.display)
+
+    def release(self) -> None:
+        if not self._released and self._generation == self._bridge._generation:
+            self._bridge._request("release", str(self._id))
+        self._released = True
+
+    def identity_key(self) -> tuple[str, int, int]:
+        self._assert_current()
+        return (self._bridge._session_id, self._generation, self._id)
+
+    def getproperty(self, name: str) -> Any:
+        return self._operation("getproperty", name=name)
+
+    def setproperty(self, name: str, value: object) -> Any:
+        return self._operation("setproperty", name=name, value=self._bridge._encode_value(value))
+
+    def setindex(self, value: object, index: object) -> Any:
+        return self._operation(
+            "setindex",
+            index=self._bridge._encode_value(index),
+            value=self._bridge._encode_value(value),
+        )
+
+    def __setitem__(self, index: object, value: object) -> None:
+        self.setindex(value, index)
+
+    def __call__(self, *args: object, **kwds: object) -> Any:
+        self._assert_current()
+        response = self._bridge._request(
+            "call_object",
+            json.dumps(
+                {
+                    "function": self._bridge._encode_value(self),
+                    "args": [self._bridge._encode_value(arg) for arg in args],
+                    "kwargs": {key: self._bridge._encode_value(value) for key, value in kwds.items()},
+                }
+            ),
+        )
+        return self._bridge._decode_value(response.structured, response.display)
+
+    def __getitem__(self, index: object) -> Any:
+        return self._operation("getindex", index=self._bridge._encode_value(index))
+
+    def __len__(self) -> int:
+        try:
+            return int(self._operation("length"))
+        except JuliaError as exc:
+            if exc.backend_type == "MethodError":
+                raise TypeError("Julia length is not defined for this object") from exc
+            raise
+
+    def __iter__(self) -> Iterator[Any]:
+        values = self._operation("iterate")
+        return iter(values)
+
+    def __contains__(self, value: object) -> bool:
+        return bool(self._operation("contains", value=self._bridge._encode_value(value)))
+
+    def backend_identical(self, other: object) -> bool:
+        return bool(self._operation("identical", other=self._bridge._encode_value(other)))
+
+    def backend_equals(self, other: object) -> bool:
+        return bool(self._operation("equal", other=self._bridge._encode_value(other)))
+
+    def introspect(self) -> dict[str, Any]:
+        entries = self._operation("introspect")
+        return {str(key): value for key, value in entries}
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, JuliaHandle):
+            return False
+        if self._bridge is not other._bridge or self._generation != other._generation:
+            return False
+        return self.backend_equals(other)
+
+    def _binary(self, function: str, other: object) -> Any:
+        return self._bridge.call(function, self, other)
+
+    def __add__(self, other: object) -> Any:
+        return self._binary("+", other)
+
+    def __mul__(self, other: object) -> Any:
+        return self._binary("*", other)
+
+    def __truediv__(self, other: object) -> Any:
+        return self._binary("/", other)
+
+    def domain(self) -> Any:
+        return self._bridge.call("domain", self)
+
+    def codomain(self) -> Any:
+        return self._bridge.call("codomain", self)
+
+    def base_ring(self) -> Any:
+        return self._bridge.call("base_ring", self)
+
+    def parent(self) -> Any:
+        return self._bridge.call("parent", self)
 
     def __del__(self) -> None:
         # Only enqueue: sending a request here could interleave with an
         # in-flight request on the same pipe (GC runs at arbitrary points).
         # Stale handles enqueue nothing: the value died with its worker.
-        if self._generation == self._bridge._generation:
+        if not self._released and self._generation == self._bridge._generation:
             self._bridge._pending_releases.append(self._id)
 
 
@@ -88,12 +235,16 @@ class Julia:
     def __init__(self, command: str | None = None) -> None:
         self._command = command or self._default_command()
         self._bridge = Path(__file__).with_name("julia_bridge.jl")
+        self._session_id = str(uuid.uuid4())
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.RLock()
         self._stderr: deque[str] = deque(maxlen=200)
         self._stderr_thread: threading.Thread | None = None
         self._pending_releases: deque[int] = deque()
         self._generation = 0
+        self._protocol_version: int | None = None
+        self._capabilities: frozenset[str] = frozenset()
+        self.conversions = ConversionRegistry()
 
     def __repr__(self) -> str:
         return "Julia"
@@ -160,7 +311,22 @@ class Julia:
         )
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
-        self._request_unlocked("ping", "")
+        self._negotiate_protocol()
+
+    def _negotiate_protocol(self) -> None:
+        response = self._request_unlocked("hello", "")
+        try:
+            metadata_value = self._decode_value(response.structured, response.display)
+            if not isinstance(metadata_value, str):
+                raise TypeError(f"hello returned {type(metadata_value).__name__}")
+            metadata = json.loads(metadata_value)
+        except Exception as exc:
+            raise JuliaProtocolError("malformed Julia bridge hello response") from exc
+        version = int(metadata["protocol_version"])
+        if version != BRIDGE_PROTOCOL_VERSION:
+            raise JuliaProtocolError(f"unsupported Julia bridge protocol version: {version}")
+        self._protocol_version = version
+        self._capabilities = frozenset(str(capability) for capability in metadata["capabilities"])
 
     def _encode(self, value: str) -> str:
         return base64.b64encode(value.encode("utf-8")).decode("ascii")
@@ -186,11 +352,13 @@ class Julia:
             self._proc.stdin.write(f"{op}\t{self._encode(payload)}\n")
             self._proc.stdin.flush()
         except BrokenPipeError as exc:
-            raise JuliaError(self._dead_process_message()) from exc
+            self._mark_worker_dead()
+            raise JuliaWorkerError(self._dead_process_message(), kind="worker-death") from exc
 
         line = self._proc.stdout.readline()
         if not line:
-            raise JuliaError(self._dead_process_message())
+            self._mark_worker_dead()
+            raise JuliaWorkerError(self._dead_process_message(), kind="worker-death")
 
         parts = line.rstrip("\n").split("\t")
         status = parts[0]
@@ -206,14 +374,39 @@ class Julia:
         if status == "err":
             if len(parts) != 4:
                 raise JuliaProtocolError(f"malformed Julia error response: {line!r}")
-            raise JuliaError(
-                self._merge_text(
-                    self._decode(parts[1]),
-                    self._decode(parts[2]),
-                    self._decode(parts[3]),
-                )
+            error_payload = self._decode(parts[1])
+            stdout_text = self._decode(parts[2])
+            stderr_text = self._decode(parts[3])
+            error_data = json.loads(error_payload)
+            message = self._merge_text(error_data["message"], stdout_text, stderr_text)
+            error_class = JuliaDispatchError if error_data["backend_type"] == "MethodError" else JuliaError
+            raise error_class(
+                message,
+                kind=error_data["kind"],
+                backend_type=error_data["backend_type"],
+                backend_stack=error_data["backend_stack"],
             )
         raise JuliaProtocolError(f"unknown Julia response status: {status!r}")
+
+    def _mark_worker_dead(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._stderr_thread = None
+        self._pending_releases.clear()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+        if proc is not None:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(proc, stream_name)
+                if stream is not None:
+                    self._close_worker_stream(stream)
+
+    def _close_worker_stream(self, stream: Any) -> None:
+        try:
+            stream.close()
+        except BrokenPipeError as exc:
+            self._stderr.append(f"worker stream close hit broken pipe: {exc}\n")
 
     def _dead_process_message(self) -> str:
         message = "Julia bridge process exited unexpectedly"
@@ -227,6 +420,9 @@ class Julia:
         return "\n".join(parts)
 
     def _encode_value(self, value: object) -> StructuredValue:
+        return self.conversions.encode_to_julia(value, self._encode_builtin_value)
+
+    def _encode_builtin_value(self, value: object) -> StructuredValue:
         if value is None:
             return {"type": "nothing"}
         if isinstance(value, bool):
@@ -273,6 +469,56 @@ class Julia:
         msg = f"unsupported Julia bridge input type: {type(value).__name__}; use eval(...) with Julia source for values outside the structured codec"
         raise TypeError(msg)
 
+    def _encode_batch_value(self, value: object) -> StructuredValue:
+        if isinstance(value, JuliaBatchRef):
+            return {"type": "batch_ref", "name": value.name}
+        if isinstance(value, (Vector, list, tuple)):
+            return {
+                "type": "vector",
+                "data": [self._encode_batch_value(entry) for entry in value],
+            }
+        if isinstance(value, Matrix):
+            entries = [self._encode_batch_value(value[i, j]) for i in range(value.nrows()) for j in range(value.ncols())]
+            return {
+                "type": "matrix",
+                "nrows": value.nrows(),
+                "ncols": value.ncols(),
+                "data": entries,
+            }
+        return self._encode_value(value)
+
+    def _encode_batch_step(self, step: dict[str, Any]) -> dict[str, Any]:
+        encoded = {key: value for key, value in step.items() if key not in {"args", "kwargs", "value", "function", "index", "object", "other"}}
+        op = step["op"]
+        if "function" in step:
+            function = step["function"]
+            encoded["function"] = function if isinstance(function, str) else self._encode_batch_value(function)
+        if "args" in step:
+            step_args = step["args"]
+        elif op in {"call", "call_object"}:
+            step_args = []
+        else:
+            step_args = None
+        if step_args is not None:
+            encoded["args"] = [self._encode_batch_value(arg) for arg in step_args]
+        if "kwargs" in step:
+            step_kwargs = step["kwargs"]
+        elif op in {"call", "call_object"}:
+            step_kwargs = {}
+        else:
+            step_kwargs = None
+        if step_kwargs is not None:
+            encoded["kwargs"] = {key: self._encode_batch_value(value) for key, value in step_kwargs.items()}
+        if "object" in step:
+            encoded["object"] = self._encode_batch_value(step["object"])
+        if "other" in step:
+            encoded["other"] = self._encode_batch_value(step["other"])
+        if "value" in step:
+            encoded["value"] = self._encode_batch_value(step["value"])
+        if "index" in step:
+            encoded["index"] = self._encode_batch_value(step["index"])
+        return encoded
+
     def _decode_value(self, payload: str | StructuredValue, display: str) -> Any:
         data = json.loads(payload) if isinstance(payload, str) else payload
         kind = data["type"]
@@ -298,8 +544,8 @@ class Julia:
             return JuliaHandle(self, data["id"], data["julia_type"], data["display"])
         if kind == "unsupported":
             julia_type = data["julia_type"]
-            msg = f"cannot convert Julia value of type {julia_type} to Sage; use eval(...) instead\n{display}"
-            raise TypeError(msg)
+            msg = f"cannot convert Julia value of type {julia_type} to Sage; the retained foreign object remains usable\n{display}"
+            raise JuliaConversionError(msg, julia_type=julia_type)
         raise JuliaProtocolError(f"unknown Julia value type: {kind!r}")
 
     def eval(self, code: str) -> str:
@@ -308,6 +554,14 @@ class Julia:
 
     def sage(self, code: str) -> Any:
         response = self._request("value", code)
+        return self._decode_value(response.structured, response.display)
+
+    def resolve(self, path: str) -> Any:
+        """Resolve a global Julia module/function/object without evaluating source."""
+
+        if not all(_JULIA_IDENTIFIER.fullmatch(part) for part in path.split(".")):
+            raise ValueError(f"invalid Julia object path: {path!r}")
+        response = self._request("resolve", path)
         return self._decode_value(response.structured, response.display)
 
     def __call__(self, code: str) -> Any:
@@ -335,30 +589,51 @@ class Julia:
         response = self._request("call", payload)
         return self._decode_value(response.structured, response.display)
 
+    def batch(self, steps: list[dict[str, Any]]) -> Any:
+        """Run structured Julia operations in one subprocess request."""
+
+        payload = json.dumps({"steps": [self._encode_batch_step(step) for step in steps]})
+        response = self._request("batch", payload)
+        return self._decode_value(response.structured, response.display)
+
     def version(self) -> str:
         return self.eval("VERSION")
 
+    def protocol_version(self) -> int:
+        self._ensure_process()
+        assert self._protocol_version is not None
+        return self._protocol_version
+
+    def capabilities(self) -> frozenset[str]:
+        self._ensure_process()
+        return self._capabilities
+
     def quit(self) -> None:
         with self._lock:
-            if self._proc is None:
+            proc = self._proc
+            if proc is None:
                 return
             try:
-                if self._proc.poll() is None:
+                if proc.poll() is None:
                     try:
                         self._request_unlocked("quit", "")
-                        self._proc.wait(timeout=2)
+                        proc.wait(timeout=2)
                     except Exception:
-                        try:
-                            self._proc.terminate()
-                            self._proc.wait(timeout=2)
-                        except Exception:
-                            self._proc.kill()
-                            self._proc.wait(timeout=2)
+                        proc = self._proc
+                        if proc is not None and proc.poll() is None:
+                            try:
+                                proc.terminate()
+                                proc.wait(timeout=2)
+                            except Exception:
+                                proc.kill()
+                                proc.wait(timeout=2)
             finally:
-                for stream_name in ("stdin", "stdout", "stderr"):
-                    stream = getattr(self._proc, stream_name)
-                    if stream is not None:
-                        stream.close()
+                proc = self._proc
+                if proc is not None:
+                    for stream_name in ("stdin", "stdout", "stderr"):
+                        stream = getattr(proc, stream_name)
+                        if stream is not None:
+                            self._close_worker_stream(stream)
                 self._proc = None
                 self._stderr_thread = None
 

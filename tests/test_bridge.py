@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 
@@ -7,10 +8,19 @@ from sage.all import QQ, ZZ, matrix, vector
 
 from sage_julia_bridge import (
     Julia,
+    JuliaConversionError,
+    JuliaDispatchError,
     JuliaError,
     JuliaHandle,
     JuliaProtocolError,
+    JuliaReleasedObjectError,
+    JuliaStaleObjectError,
+    JuliaWorkerError,
+    SageOscarRealizationMap,
+    batch_ref,
+    julia,
 )
+from sage_julia_bridge.interface import BridgeResponse
 
 
 class JuliaBridgeTest(unittest.TestCase):
@@ -56,6 +66,14 @@ class JuliaBridgeTest(unittest.TestCase):
         major, minor = self.bridge.version().split(".")[:2]
         self.assertGreaterEqual(int(major), 1)
         self.assertGreaterEqual(int(minor), 0)
+
+    def test_protocol_negotiation_reports_version_and_capabilities(self) -> None:
+        capabilities = self.bridge.capabilities()
+
+        self.assertEqual(self.bridge.protocol_version(), 1)
+        self.assertIn("runtime.retained-objects", capabilities)
+        self.assertIn("runtime.batch", capabilities)
+        self.assertIn("transport.structured-errors", capabilities)
 
     def test_sage_call_alias(self) -> None:
         self.assertEqual(self.bridge("2 * 3"), ZZ(6))
@@ -157,7 +175,7 @@ class JuliaBridgeTest(unittest.TestCase):
 
     def test_protocol_violations_raise(self) -> None:
         # A real subprocess speaking broken protocol over real pipes: the
-        # shim answers the startup ping with each malformed frame class
+        # shim answers the startup hello with each malformed frame class
         # (short ok reply, short err reply, unknown status).
         import shlex
         import sys
@@ -185,15 +203,16 @@ class JuliaBridgeTest(unittest.TestCase):
         def b64(text: str) -> str:
             return base64.b64encode(text.encode()).decode()
 
-        nothing_node = b64('{"type":"nothing"}')
+        hello_text = '{"protocol_version":1,"capabilities":["runtime.retained-objects"]}'
+        hello_node = b64(json.dumps({"type": "string", "value": hello_text}))
         bogus_node = b64('{"type":"bogus"}')
-        ok_nothing = f"ok\t\t{nothing_node}\t\t"
+        ok_hello = f"ok\t{b64(hello_text)}\t{hello_node}\t\t"
         ok_bogus = f"ok\t\t{bogus_node}\t\t"
         with tempfile.TemporaryDirectory() as tmp:
             shim = Path(tmp) / "shim.py"
             shim.write_text(
                 "import sys\n"
-                "for reply in (" + repr(ok_nothing) + ", " + repr(ok_bogus) + "):\n"
+                "for reply in (" + repr(ok_hello) + ", " + repr(ok_bogus) + "):\n"
                 "    sys.stdin.readline()\n"
                 "    sys.stdout.write(reply + '\\n')\n"
                 "    sys.stdout.flush()\n"
@@ -324,9 +343,9 @@ class ProtocolTest(unittest.TestCase):
             stale = bridge.sage("x -> 10 * x")
             bridge.quit()
             fresh = bridge.sage("x -> 2 * x")  # restarts worker, id 1 again
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(JuliaError):
                 bridge.call("map", stale, [ZZ(1), ZZ(2)])
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(JuliaError):
                 stale.sage()
             # A stale handle's GC must not release the new worker's entry.
             del stale
@@ -342,6 +361,545 @@ class ProtocolTest(unittest.TestCase):
     def test_dict_input_rejected(self) -> None:
         with self.assertRaises(TypeError):
             self.bridge.set("d", {"a": 1})
+
+
+class Issue11KernelCutoverRedProof(unittest.TestCase):
+    """Production-boundary red proof for the issue #11 object-model cutover."""
+
+    bridge: Julia
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = Julia()
+        cls.bridge.eval(
+            """
+module Issue11FreshRuntime
+export Box, IndexedBox, AffineCallable, box_value, make_affine, same_object, explode_structured
+
+mutable struct Box
+    value::Int
+end
+
+mutable struct IndexedBox
+    values::Vector{Int}
+end
+
+struct AffineCallable
+    scale::Int
+    shift::Int
+end
+
+(f::AffineCallable)(x) = f.scale * x + f.shift
+Base.getindex(box::Box, i::Int) = box.value + i
+Base.iterate(box::Box, state=1) = state > 3 ? nothing : (box.value + state, state + 1)
+Base.length(box::IndexedBox) = length(box.values)
+Base.getindex(box::IndexedBox, i::Int) = box.values[i]
+Base.setindex!(box::IndexedBox, value::Int, i::Int) = (box.values[i] = value; box)
+Base.iterate(box::IndexedBox, state=1) = state > length(box.values) ? nothing : (box.values[state], state + 1)
+Base.:(==)(left::IndexedBox, right::IndexedBox) = left.values == right.values
+box_value(box::Box) = box.value
+make_affine(scale, shift) = value -> scale * value + shift
+same_object(left, right) = left === right
+explode_structured(::Box) = throw(DomainError(:issue11_box, "structured backend failure witness"))
+end
+using .Issue11FreshRuntime
+"""
+        )
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.quit()
+
+    def test_fresh_runtime_callable_object_is_directly_invokable(self) -> None:
+        module = self.bridge.resolve("Issue11FreshRuntime")
+        constructor = module.getproperty("AffineCallable")
+        callable_object = constructor(ZZ(3), ZZ(5))
+        returned_closure = self.bridge.resolve("Issue11FreshRuntime.make_affine")(ZZ(4), ZZ(1))
+
+        self.assertEqual(callable_object(ZZ(4)), ZZ(17))
+        self.assertEqual(returned_closure(ZZ(6)), ZZ(25))
+
+    def test_fresh_runtime_type_supports_properties_indexing_iteration_and_mutation(self) -> None:
+        box = self.bridge.sage("Box(41)")
+
+        self.assertEqual(box.getproperty("value"), ZZ(41))
+        box.setproperty("value", ZZ(58))
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(58))
+        self.assertEqual(box[ZZ(2)], ZZ(60))
+        self.assertEqual(list(box), [ZZ(59), ZZ(60), ZZ(61)])
+
+    def test_fresh_runtime_type_supports_length_setindex_equality_and_introspection(self) -> None:
+        box, equal_box, distinct_box = self.bridge.sage("begin box = IndexedBox([4, 5, 6]); (box, IndexedBox([4, 5, 6]), IndexedBox([4, 5, 7])) end")
+
+        self.assertEqual(len(box), 3)
+        self.assertEqual(box[ZZ(2)], ZZ(5))
+        self.assertTrue(ZZ(5) in box)
+        box[ZZ(2)] = ZZ(41)
+        self.assertEqual(list(box), [ZZ(4), ZZ(41), ZZ(6)])
+        self.assertFalse(box.backend_equals(equal_box))
+        self.assertFalse(box == equal_box)
+        self.assertFalse(box.backend_identical(equal_box))
+        self.assertFalse(box.backend_equals(distinct_box))
+
+        alias = self.bridge.call("identity", box)
+        self.assertTrue(box.backend_identical(alias))
+        self.assertTrue(box.backend_equals(alias))
+        description = box.introspect()
+        self.assertEqual(description["julia_type"], "IndexedBox")
+        self.assertEqual(description["length_applicable"], True)
+        self.assertEqual(description["iteration_applicable"], True)
+        self.assertEqual(description["indexing_applicable"], True)
+        self.assertGreaterEqual(description["retained_references"], ZZ(2))
+
+    def test_nested_results_preserve_repeated_foreign_reference_identity(self) -> None:
+        graph = self.bridge.sage("begin shared = Box(7); Any[shared, [shared, 11], (shared, shared)] end")
+        first = graph[0]
+        nested = graph[1][0]
+        tuple_left, tuple_right = graph[2]
+
+        self.assertEqual(graph[1][1], ZZ(11))
+        self.assertEqual(first.identity_key(), nested.identity_key())
+        self.assertEqual(tuple_left.identity_key(), tuple_right.identity_key())
+        self.assertTrue(self.bridge.call("same_object", first, tuple_left))
+
+    def test_release_reference_accounting_preserves_other_live_proxy(self) -> None:
+        with Julia() as bridge:
+            bridge.eval(
+                """
+module Issue11ReleaseRuntime
+export Box, box_value
+
+mutable struct Box
+    value::Int
+end
+
+box_value(box::Box) = box.value
+end
+using .Issue11ReleaseRuntime
+"""
+            )
+            first, second = bridge.sage("begin shared = Box(97); (shared, shared) end")
+
+            self.assertEqual(first.identity_key(), second.identity_key())
+            self.assertEqual(first.introspect()["retained_references"], ZZ(2))
+            first.release()
+            self.assertEqual(bridge.call("box_value", second), ZZ(97))
+            self.assertEqual(second.introspect()["retained_references"], ZZ(1))
+            with self.assertRaises(JuliaReleasedObjectError) as released:
+                first.sage()
+            self.assertEqual(getattr(released.exception, "kind"), "released-object")
+            second.release()
+            second.release()
+            with self.assertRaises(JuliaReleasedObjectError) as again_released:
+                second.getproperty("value")
+            self.assertEqual(getattr(again_released.exception, "kind"), "released-object")
+
+    def test_conversion_refusal_leaves_foreign_object_usable(self) -> None:
+        box = self.bridge.sage("Box(13)")
+
+        with self.assertRaises(JuliaConversionError) as raised:
+            box.sage()
+        self.assertEqual(getattr(raised.exception, "kind"), "conversion-refused")
+        self.assertEqual(getattr(raised.exception, "backend_type"), "Box")
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(13))
+
+    def test_target_directed_sage_conversion_registry(self) -> None:
+        target = ("issue-11", "box-value")
+
+        self.bridge.conversions.register_to_sage(target, lambda handle: handle.getproperty("value"))
+        box = self.bridge.sage("Box(19)")
+
+        self.assertEqual(box.sage(target), ZZ(19))
+        with self.assertRaises(JuliaConversionError) as raised:
+            box.sage(("issue-11", "unregistered"))
+        self.assertEqual(getattr(raised.exception, "kind"), "conversion-refused")
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(19))
+
+    def test_outbound_conversion_registry_is_recursive(self) -> None:
+        class RuntimeInt:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+        self.bridge.conversions.register_to_julia(
+            lambda value: isinstance(value, RuntimeInt),
+            lambda value, _encode: {"type": "int", "value": str(value.value)} if isinstance(value, RuntimeInt) else None,
+        )
+
+        self.assertEqual(self.bridge.call("+", RuntimeInt(8), ZZ(5)), ZZ(13))
+        self.assertEqual(self.bridge.call("sum", [RuntimeInt(2), RuntimeInt(3), ZZ(5)]), ZZ(10))
+
+    def test_backend_failures_are_structured_and_do_not_poison_worker(self) -> None:
+        box = self.bridge.sage("Box(23)")
+
+        with self.assertRaises(JuliaError) as raised:
+            self.bridge.call("explode_structured", box)
+        self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
+        with self.assertRaises(JuliaDispatchError) as dispatch:
+            self.bridge.call("sin", box)
+        self.assertEqual(getattr(dispatch.exception, "backend_type"), "MethodError")
+        self.assertEqual(self.bridge.call("box_value", box), ZZ(23))
+
+    def test_structured_batch_preserves_intermediate_identity_in_one_request(self) -> None:
+        class CountingJulia(Julia):
+            def __init__(self) -> None:
+                super().__init__()
+                self.operations: list[str] = []
+
+            def _request_unlocked(self, op: str, payload: str) -> BridgeResponse:
+                self.operations.append(op)
+                return super()._request_unlocked(op, payload)
+
+        bridge = CountingJulia()
+        try:
+            bridge.eval(
+                """
+module Issue11BatchRuntime
+export Box, box_value, same_object, explode_structured
+
+mutable struct Box
+    value::Int
+end
+
+box_value(box::Box) = box.value
+same_object(left, right) = left === right
+explode_structured(::Box) = throw(DomainError(:issue11_box, "structured backend failure witness"))
+end
+using .Issue11BatchRuntime
+"""
+            )
+            box = bridge.sage("Box(29)")
+            bridge.operations.clear()
+            first, second, value = bridge.batch(
+                [
+                    {"op": "call", "bind": "first", "function": "identity", "args": [box]},
+                    {"op": "call", "bind": "second", "function": "identity", "args": [batch_ref("first")]},
+                    {"op": "call", "bind": "value", "function": "box_value", "args": [batch_ref("second")]},
+                    {"op": "result", "value": [batch_ref("first"), batch_ref("second"), batch_ref("value")]},
+                ]
+            )
+
+            self.assertEqual(bridge.operations, ["batch"])
+            self.assertEqual(value, ZZ(29))
+            self.assertEqual(first.identity_key(), second.identity_key())
+            self.assertTrue(bridge.call("same_object", first, box))
+
+            with self.assertRaises(JuliaError) as raised:
+                bridge.batch([{"op": "call", "function": "explode_structured", "args": [box]}])
+            self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
+            self.assertEqual(bridge.call("box_value", box), ZZ(29))
+        finally:
+            bridge.quit()
+
+    def test_half_dead_worker_exit_restarts_and_stales_old_objects(self) -> None:
+        with Julia() as bridge:
+            bridge.eval(
+                """
+module Issue11RestartRuntime
+export Box
+
+mutable struct Box
+    value::Int
+end
+end
+using .Issue11RestartRuntime
+"""
+            )
+            old_pid = bridge.sage("getpid()")
+            stale = bridge.sage("Box(31)")
+            with self.assertRaises(JuliaWorkerError):
+                bridge.eval("exit(86)")
+            new_pid = bridge.sage("getpid()")
+
+            self.assertNotEqual(new_pid, old_pid)
+            with self.assertRaises(JuliaStaleObjectError) as raised:
+                stale.getproperty("value")
+            self.assertEqual(getattr(raised.exception, "kind"), "stale-object")
+            self.assertEqual(bridge.sage("1 + 1"), ZZ(2))
+
+    def test_prime_localization_returns_native_sage_facade_objects(self) -> None:
+        from sage.all import PolynomialRing
+        from sage.categories.fields import Fields
+        from sage.rings.ideal import Ideal_generic
+        from sage.rings.morphism import RingHomomorphism
+
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+        PrimeLocalRings = getattr(sage_julia_bridge, "PrimeLocalRings")
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+        L, iota = prime_localization(R, R.ideal([x]))
+        local_element = iota(x)
+        local_sum = iota(x + y)
+        residue_field, rho = L.residue_field()
+
+        self.assertIsInstance(iota, SageOscarRealizationMap)
+        self.assertIsInstance(iota, RingHomomorphism)
+        self.assertIsInstance(L.maximal_ideal(), Ideal_generic)
+        self.assertIsInstance(rho, RingHomomorphism)
+        self.assertIn(L, PrimeLocalRings())
+        self.assertIn(residue_field, Fields())
+        self.assertIs(iota.domain(), R)
+        self.assertIs(iota.codomain(), L)
+        self.assertIs(rho.domain(), L)
+        self.assertIs(rho.codomain(), residue_field)
+        self.assertEqual(rho.kernel(), L.maximal_ideal())
+        self.assertTrue(rho.is_surjective())
+        self.assertIs(local_element.parent(), L)
+        self.assertFalse(local_element.is_unit())
+        self.assertTrue(iota(y).is_unit())
+        self.assertEqual(L.maximal_ideal(), L.ideal([x]))
+        self.assertEqual(rho(local_element), residue_field.zero())
+        self.assertEqual(rho(iota(y)), residue_field.gen(1))
+        self.assertTrue(iota.oscar().domain().backend_identical(L.oscar().base_ring()))
+        self.assertEqual(L.maximal_ideal().oscar().base_ring(), L.oscar())
+        self.assertEqual(julia.call("characteristic", residue_field.oscar()), ZZ(0))
+        self.assertEqual(rho.oscar().domain(), L.oscar())
+        self.assertTrue(local_sum.oscar().backend_equals(iota.oscar()(x + y)))
+        self.assertEqual(iota(ZZ(3)), L(ZZ(3)))
+
+        S = PolynomialRing(QQ, ["u", "v"], order="degrevlex")
+        with self.assertRaises(JuliaConversionError) as map_raised:
+            iota(S.gen(0))
+        self.assertEqual(getattr(map_raised.exception, "kind"), "parent-incompatible")
+        with self.assertRaises(JuliaConversionError) as constructor_raised:
+            L(S.gen(0))
+        self.assertEqual(getattr(constructor_raised.exception, "kind"), "parent-incompatible")
+
+    def test_noncoordinate_prime_localization_residue_and_ideal_workflow(self) -> None:
+        from sage.all import PolynomialRing
+
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+        circle = x**2 + y**2 - 1
+        prime = R.ideal([circle])
+        L, iota = prime_localization(R, prime)
+        maximal = L.maximal_ideal()
+        residue_field, rho = L.residue_field()
+        quotient = R.quotient(prime)
+
+        y_local = iota(y)
+        local_fraction = L(x + y, y)
+
+        self.assertTrue(prime.is_prime())
+        self.assertTrue(y_local.is_unit())
+        self.assertEqual(y_local * y_local.inverse(), L(1))
+        self.assertTrue(iota(circle) in maximal)
+        self.assertTrue(maximal.is_maximal())
+        self.assertIs(maximal.quotient(), residue_field)
+        self.assertIs(L.quotient(maximal), residue_field)
+        self.assertEqual(L.fraction_field(), R.fraction_field())
+        self.assertEqual(local_fraction * y_local, iota(x + y))
+        self.assertEqual(rho(iota(circle)), residue_field.zero())
+        self.assertEqual(rho(local_fraction), residue_field(quotient(x + y)) / residue_field(quotient(y)))
+        self.assertTrue(local_fraction.oscar().backend_equals(iota.oscar()(x + y) / iota.oscar()(y)))
+        self.assertEqual((rho * iota)(circle), residue_field.zero())
+        self.assertEqual(rho.kernel(), maximal)
+
+        with self.assertRaises(ZeroDivisionError):
+            L(x, circle)
+        with self.assertRaises(ZeroDivisionError):
+            iota(circle).inverse()
+
+    def test_integer_prime_localization_uses_retained_oscar_local_ring(self) -> None:
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+
+        L, iota = prime_localization(ZZ, ZZ.ideal(5))
+        maximal = L.maximal_ideal()
+        residue_field, rho = L.residue_field()
+
+        two = iota(ZZ(2))
+        five = iota(ZZ(5))
+
+        self.assertIs(two.parent(), L)
+        self.assertTrue(two.is_unit())
+        self.assertFalse(five.is_unit())
+        self.assertEqual(two * two.inverse(), L(1))
+        self.assertTrue(five in maximal)
+        self.assertFalse(two in maximal)
+        self.assertEqual(maximal.gens(), (five,))
+        self.assertEqual(rho(two), residue_field(2))
+        self.assertEqual(rho(five), residue_field.zero())
+        self.assertEqual(residue_field.order(), ZZ(5))
+        self.assertEqual(rho.kernel(), maximal)
+        self.assertTrue(rho.is_surjective())
+        self.assertEqual(iota.oscar().getproperty("domain").sage(), ZZ)
+        self.assertEqual(iota.oscar().getproperty("codomain").base_ring().sage(), ZZ)
+        self.assertEqual(L.oscar().base_ring().sage(), ZZ)
+        self.assertTrue(two.oscar().backend_equals(iota.oscar()(ZZ(2))))
+
+        with self.assertRaises(ZeroDivisionError):
+            L(ZZ(1), ZZ(5))
+        with self.assertRaises(ZeroDivisionError):
+            five.inverse()
+
+    def test_localization_invalid_paths_are_typed_and_leave_worker_usable(self) -> None:
+        from sage.all import PolynomialRing
+
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+        with self.assertRaises(ValueError):
+            prime_localization(R, R.ideal([x * y]))
+
+        L, iota = prime_localization(R, R.ideal([x]))
+        retained = iota(y).oscar()
+        retained.release()
+        with self.assertRaises(JuliaError) as released:
+            julia.call("is_unit", retained)
+        self.assertEqual(getattr(released.exception, "kind"), "released-object")
+
+        stale = iota(x).oscar()
+        old_pid = julia.sage("getpid()")
+        with self.assertRaises(JuliaError):
+            julia.eval("exit(86)")
+        self.assertNotEqual(julia.sage("getpid()"), old_pid)
+        with self.assertRaises(JuliaError) as stale_error:
+            julia.call("is_unit", stale)
+        self.assertEqual(getattr(stale_error.exception, "kind"), "stale-object")
+        self.assertEqual(julia.sage("6 * 7"), ZZ(42))
+
+
+class Issue11GenericOscarSentinelTest(unittest.TestCase):
+    """Cross-domain proof that the core object runtime is not ring-shaped."""
+
+    bridge: Julia
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.bridge = Julia()
+        cls.bridge.eval("using Oscar")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.bridge.quit()
+
+    def test_free_module_element_composes_without_codec(self) -> None:
+        module, submodule, inclusion, quotient, projection, kernel, kernel_inclusion, relation = self.bridge.sage(
+            """
+begin
+    M = free_module(QQ, 3)
+    e1, e2, e3 = gens(M)
+    S, inc = sub(M, [e1 + 2*e2])
+    Q, proj = quo(M, S)
+    K, kinc = kernel(proj)
+    (M, S, inc, Q, proj, K, kinc, e1 + 2*e2)
+end
+"""
+        )
+
+        self.assertEqual(inclusion.domain().identity_key(), submodule.identity_key())
+        self.assertEqual(inclusion.codomain().identity_key(), module.identity_key())
+        self.assertEqual(projection.domain().identity_key(), module.identity_key())
+        self.assertEqual(projection.codomain().identity_key(), quotient.identity_key())
+        self.assertEqual(kernel_inclusion.domain().identity_key(), kernel.identity_key())
+        self.assertEqual(kernel_inclusion.codomain().identity_key(), module.identity_key())
+        self.assertTrue(self.bridge.call("is_zero", projection(relation)))
+        submodule_generator = self.bridge.call("gen", submodule, ZZ(1))
+        kernel_generator = self.bridge.call("gen", kernel, ZZ(1))
+        self.assertTrue(inclusion(submodule_generator).backend_equals(kernel_inclusion(kernel_generator)))
+
+    def test_matrix_algebra_element_composes_without_codec(self) -> None:
+        algebra, center, center_inclusion, central_element, product, center_dimension = self.bridge.sage(
+            """
+begin
+    A = matrix_algebra(QQ, 2)
+    C, CtoA = center(A)
+    c = basis(C)[1]
+    a = A(matrix(QQ, [1 2; 3 5]))
+    (A, C, CtoA, CtoA(c), a*a, dimension_of_center(A))
+end
+"""
+        )
+
+        self.assertEqual(center_dimension, ZZ(1))
+        self.assertEqual(center_inclusion.domain().identity_key(), center.identity_key())
+        self.assertEqual(center_inclusion.codomain().identity_key(), algebra.identity_key())
+        self.assertEqual(self.bridge.call("parent", central_element).identity_key(), algebra.identity_key())
+        self.assertEqual(self.bridge.call("parent", product).identity_key(), algebra.identity_key())
+        self.assertTrue(self.bridge.call("is_central", algebra))
+
+    def test_affine_scheme_subobject_and_morphism_preserve_graph(self) -> None:
+        scheme, coordinate_ring, closed, closed_ring, inclusion, pullback, defining_kernel, identity_map = self.bridge.sage(
+            """
+begin
+    X = affine_space(QQ, 3)
+    R = OO(X)
+    x1, x2, x3 = gens(R)
+    Y = subscheme(X, x1*x2 - x3)
+    S = OO(Y)
+    inc = inclusion_morphism(Y, X)
+    pb = pullback(inc)
+    K = kernel(pb)
+    (X, R, Y, S, inc, pb, K, identity_map(X))
+end
+"""
+        )
+
+        self.assertEqual(inclusion.domain().identity_key(), closed.identity_key())
+        self.assertEqual(inclusion.codomain().identity_key(), scheme.identity_key())
+        self.assertEqual(pullback.domain().identity_key(), coordinate_ring.identity_key())
+        self.assertEqual(pullback.codomain().identity_key(), closed_ring.identity_key())
+        self.assertEqual(self.bridge.call("base_ring", defining_kernel).identity_key(), pullback.domain().identity_key())
+        self.assertTrue(self.bridge.call("compose", inclusion, identity_map).backend_equals(inclusion))
+
+    def test_indefinite_lattice_ambient_space_and_invariants(self) -> None:
+        lattice, ambient, gram, scaled, scaled_ambient, determinant, signature = self.bridge.sage(
+            """
+begin
+    G = matrix(QQ, [1 0 0; 0 -1 0; 0 0 2])
+    L = quadratic_lattice(QQ; gram=G)
+    M = 2*L
+    (L, ambient_space(L), gram_matrix(L), M, ambient_space(M), det(gram_matrix(L)), signature_tuple(L))
+end
+"""
+        )
+
+        self.assertEqual(determinant, ZZ(-2))
+        self.assertEqual(signature, [ZZ(2), ZZ(0), ZZ(1)])
+        self.assertEqual(self.bridge.call("rank", lattice), ZZ(3))
+        self.assertEqual(self.bridge.call("ambient_space", lattice).identity_key(), ambient.identity_key())
+        self.assertEqual(self.bridge.call("ambient_space", scaled).identity_key(), scaled_ambient.identity_key())
+        self.assertTrue(self.bridge.call("is_integral", scaled))
+        self.assertEqual(self.bridge.call("det", gram), ZZ(-2))
+
+    def test_group_subgroup_homomorphism_and_heterogeneous_graph(self) -> None:
+        group, subgroup, embedding, homomorphism, image, image_embedding, module, projection, repeated = self.bridge.sage(
+            """
+begin
+    G = symmetric_group(4)
+    H, emb = derived_subgroup(G)
+    phi = id_hom(G)
+    I, iemb = image(phi)
+    M = free_module(QQ, 2)
+    S, _ = sub(M, [gen(M, 1)])
+    Q, proj = quo(M, S)
+    (G, H, emb, phi, I, iemb, M, proj, Any[G, M, phi, proj, G, M])
+end
+"""
+        )
+
+        self.assertEqual(embedding.domain().identity_key(), subgroup.identity_key())
+        self.assertEqual(embedding.codomain().identity_key(), group.identity_key())
+        self.assertEqual(homomorphism.domain().identity_key(), group.identity_key())
+        self.assertEqual(homomorphism.codomain().identity_key(), group.identity_key())
+        self.assertEqual(image_embedding.domain().identity_key(), image.identity_key())
+        self.assertEqual(self.bridge.call("order", subgroup), ZZ(12))
+        self.assertEqual(projection.domain().identity_key(), module.identity_key())
+        self.assertEqual(repeated[0].identity_key(), repeated[4].identity_key())
+        self.assertEqual(repeated[1].identity_key(), repeated[5].identity_key())
+        self.assertEqual(repeated[2].identity_key(), homomorphism.identity_key())
+        self.assertEqual(repeated[3].identity_key(), projection.identity_key())
 
 
 class MrdiCodecTest(unittest.TestCase):
@@ -695,8 +1253,13 @@ end
     def test_parent_objects_decode(self) -> None:
         from sage.all import GF
 
-        self.assertIs(self.bridge.sage("ZZ"), ZZ)
-        self.assertIs(self.bridge.sage("GF(7)"), GF(7))
+        integer_ring = self.bridge.sage("ZZ")
+        finite_field = self.bridge.sage("GF(7)")
+
+        self.assertIsInstance(integer_ring, JuliaHandle)
+        self.assertIsInstance(finite_field, JuliaHandle)
+        self.assertIs(integer_ring.sage(), ZZ)
+        self.assertIs(finite_field.sage(), GF(7))
 
     def test_qualified_import_oscar(self) -> None:
         # `import Oscar` binds only Main.Oscar — Nemo must be resolved from
