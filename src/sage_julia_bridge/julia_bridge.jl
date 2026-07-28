@@ -92,11 +92,15 @@ end
 # Opaque references to worker-held values the structured codec does not
 # cover. Keyed by a monotone id; entries live until the client releases them.
 const HANDLES = Dict{Int,Any}()
+const HANDLE_IDS = IdDict{Any,Int}()
 const HANDLE_COUNTER = Ref(0)
 
 function register_handle(x)
+    existing = get(HANDLE_IDS, x, nothing)
+    existing === nothing || return existing
     id = (HANDLE_COUNTER[] += 1)
     HANDLES[id] = x
+    HANDLE_IDS[x] = id
     return id
 end
 
@@ -167,6 +171,35 @@ end
 # wrap=true: uncovered values become handles (sage()/call() results).
 # wrap=false: uncovered values report unsupported (explicit materialization).
 function encode_value(x, wrap::Bool)
+    converted = nemo_to_base(x)
+    converted === nothing || return encode_value(converted, wrap)
+    if x === nothing
+        return "{\"type\":\"nothing\"}"
+    elseif x isa Bool
+        return "{\"type\":\"bool\",\"value\":" * (x ? "true" : "false") * "}"
+    elseif x isa AbstractString
+        return "{\"type\":\"string\",\"value\":" * json_string(x) * "}"
+    elseif x isa Integer
+        return "{\"type\":\"int\",\"value\":" * json_string(string(x)) * "}"
+    elseif x isa Rational
+        return (
+            "{\"type\":\"rational\",\"num\":" * json_string(string(numerator(x))) *
+            ",\"den\":" * json_string(string(denominator(x))) * "}"
+        )
+    elseif x isa Tuple
+        values = String[encode_value(item, wrap) for item in x]
+        return "{\"type\":\"vector\",\"data\":[" * join(values, ",") * "]}"
+    elseif x isa AbstractVector
+        values = String[encode_value(item, wrap) for item in x]
+        return "{\"type\":\"vector\",\"data\":[" * join(values, ",") * "]}"
+    elseif x isa AbstractMatrix
+        values = String[encode_value(x[i, j], wrap) for i in axes(x, 1), j in axes(x, 2)]
+        return (
+            "{\"type\":\"matrix\",\"nrows\":" * string(size(x, 1)) *
+            ",\"ncols\":" * string(size(x, 2)) *
+            ",\"data\":[" * join(values, ",") * "]}"
+        )
+    end
     encoded = encode_supported(x)
     encoded === nothing || return encoded
     encoded = try_mrdi(x)
@@ -180,6 +213,11 @@ function encode_value(x, wrap::Bool)
         ",\"julia_type\":" * json_string(string(typeof(x))) *
         ",\"display\":" * json_string(display_text(x)) * "}"
     )
+end
+
+function lookup_handle(id::Int)
+    haskey(HANDLES, id) || error("unknown handle id: ", id)
+    return HANDLES[id]
 end
 
 function decode_value(node::AbstractDict)
@@ -208,8 +246,7 @@ function decode_value(node::AbstractDict)
         return [decode_value(data[(i - 1) * ncols + j]) for i in 1:nrows, j in 1:ncols]
     elseif kind == "handle"
         id = node["id"]::Int
-        haskey(HANDLES, id) || error("unknown handle id: ", id)
-        return HANDLES[id]
+        return lookup_handle(id)
     elseif kind == "mrdi"
         isdefined(Main, :Oscar) ||
             error("mrdi payload requires Oscar; run eval(\"using Oscar\") first")
@@ -270,6 +307,17 @@ function evaluate(code::AbstractString)
     return capture(() -> Base.include_string(Main, code, "sage_julia_bridge"))
 end
 
+function collect_by_iteration(x)
+    values = Any[]
+    next = iterate(x)
+    while next !== nothing
+        value, state = next
+        push!(values, value)
+        next = iterate(x, state)
+    end
+    return values
+end
+
 function reply(parts::Vector{String})
     println(stdout, join(parts, '\t'))
     flush(stdout)
@@ -302,15 +350,44 @@ function handle_request(op::String, payload::String)
         kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
         value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))
         return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "call_object"
+        request = JSON.parse(payload)
+        f = decode_value(request["function"])
+        args = Any[decode_value(item) for item in request["args"]]
+        kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
+        value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))
+        return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+    elseif op == "object"
+        request = JSON.parse(payload)
+        object_op = request["op"]::String
+        object = lookup_handle(request["id"]::Int)
+        if object_op == "getproperty"
+            value, stdout_text, stderr_text = capture(() -> getproperty(object, Symbol(request["name"]::String)))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "setproperty"
+            new_value = decode_value(request["value"])
+            value, stdout_text, stderr_text = capture(() -> setproperty!(object, Symbol(request["name"]::String), new_value))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "getindex"
+            index = decode_value(request["index"])
+            value, stdout_text, stderr_text = capture(() -> getindex(object, index))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        elseif object_op == "iterate"
+            value, stdout_text, stderr_text = capture(() -> collect_by_iteration(object))
+            return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
+        end
+        error("unknown object operation: ", object_op)
     elseif op == "materialize"
         id = parse(Int, payload)
-        haskey(HANDLES, id) || error("unknown handle id: ", id)
-        x = HANDLES[id]
+        x = lookup_handle(id)
         return (display_text(x), encode_value(x, false), "", "")
     elseif op == "release"
         id = parse(Int, payload)
-        haskey(HANDLES, id) || error("unknown handle id: ", id)
-        delete!(HANDLES, id)
+        if haskey(HANDLES, id)
+            value = HANDLES[id]
+            delete!(HANDLES, id)
+            delete!(HANDLE_IDS, value)
+        end
         return ("", NOTHING_NODE, "", "")
     end
     error("unknown bridge operation: ", op)
@@ -343,6 +420,13 @@ for line in eachline(stdin)
         ])
     catch ex
         message = sprint(io -> showerror(io, ex, catch_backtrace()))
-        reply(["err", b64(message), b64(""), b64("")])
+        payload = (
+            "{\"type\":\"julia_error\",\"kind\":\"backend\",\"backend_type\":" *
+            json_string(string(nameof(typeof(ex)))) *
+            ",\"message\":" * json_string(message) *
+            ",\"backend_stack\":" * json_string(sprint(io -> show(io, catch_backtrace()))) *
+            "}"
+        )
+        reply(["err", b64(payload), b64(""), b64("")])
     end
 end

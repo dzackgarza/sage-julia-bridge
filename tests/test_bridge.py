@@ -324,9 +324,9 @@ class ProtocolTest(unittest.TestCase):
             stale = bridge.sage("x -> 10 * x")
             bridge.quit()
             fresh = bridge.sage("x -> 2 * x")  # restarts worker, id 1 again
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(JuliaError):
                 bridge.call("map", stale, [ZZ(1), ZZ(2)])
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(JuliaError):
                 stale.sage()
             # A stale handle's GC must not release the new worker's entry.
             del stale

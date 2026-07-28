@@ -16,7 +16,9 @@ import shlex
 import shutil
 import subprocess
 import threading
+import uuid
 from collections import deque
+from collections.abc import Iterator
 from numbers import Integral, Rational
 from pathlib import Path
 from typing import Any
@@ -67,12 +69,62 @@ class JuliaHandle:
     def _assert_current(self) -> None:
         # Ids restart with each worker process; a stale id would silently
         # resolve to a different object in the new worker's table.
-        assert self._generation == self._bridge._generation, f"stale handle from a previous Julia worker: {self!r}"
+        if self._generation != self._bridge._generation:
+            raise JuliaError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
+
+    def _operation(self, operation: str, **payload: object) -> Any:
+        self._assert_current()
+        response = self._bridge._request(
+            "object",
+            json.dumps(
+                {
+                    "op": operation,
+                    "id": self._id,
+                    **payload,
+                }
+            ),
+        )
+        return self._bridge._decode_value(response.structured, response.display)
 
     def sage(self) -> Any:
         self._assert_current()
         response = self._bridge._request("materialize", str(self._id))
         return self._bridge._decode_value(response.structured, response.display)
+
+    def release(self) -> None:
+        if self._generation == self._bridge._generation:
+            self._bridge._request("release", str(self._id))
+
+    def identity_key(self) -> tuple[str, int, int]:
+        self._assert_current()
+        return (self._bridge._session_id, self._generation, self._id)
+
+    def getproperty(self, name: str) -> Any:
+        return self._operation("getproperty", name=name)
+
+    def setproperty(self, name: str, value: object) -> Any:
+        return self._operation("setproperty", name=name, value=self._bridge._encode_value(value))
+
+    def __call__(self, *args: object, **kwds: object) -> Any:
+        self._assert_current()
+        response = self._bridge._request(
+            "call_object",
+            json.dumps(
+                {
+                    "function": self._bridge._encode_value(self),
+                    "args": [self._bridge._encode_value(arg) for arg in args],
+                    "kwargs": {key: self._bridge._encode_value(value) for key, value in kwds.items()},
+                }
+            ),
+        )
+        return self._bridge._decode_value(response.structured, response.display)
+
+    def __getitem__(self, index: object) -> Any:
+        return self._operation("getindex", index=self._bridge._encode_value(index))
+
+    def __iter__(self) -> Iterator[Any]:
+        values = self._operation("iterate")
+        return iter(values)
 
     def __del__(self) -> None:
         # Only enqueue: sending a request here could interleave with an
@@ -88,6 +140,7 @@ class Julia:
     def __init__(self, command: str | None = None) -> None:
         self._command = command or self._default_command()
         self._bridge = Path(__file__).with_name("julia_bridge.jl")
+        self._session_id = str(uuid.uuid4())
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.RLock()
         self._stderr: deque[str] = deque(maxlen=200)
@@ -186,10 +239,12 @@ class Julia:
             self._proc.stdin.write(f"{op}\t{self._encode(payload)}\n")
             self._proc.stdin.flush()
         except BrokenPipeError as exc:
+            self._mark_worker_dead()
             raise JuliaError(self._dead_process_message()) from exc
 
         line = self._proc.stdout.readline()
         if not line:
+            self._mark_worker_dead()
             raise JuliaError(self._dead_process_message())
 
         parts = line.rstrip("\n").split("\t")
@@ -206,14 +261,38 @@ class Julia:
         if status == "err":
             if len(parts) != 4:
                 raise JuliaProtocolError(f"malformed Julia error response: {line!r}")
+            error_payload = self._decode(parts[1])
+            stdout_text = self._decode(parts[2])
+            stderr_text = self._decode(parts[3])
+            error_data = json.loads(error_payload)
+            message = self._merge_text(error_data["message"], stdout_text, stderr_text)
             raise JuliaError(
-                self._merge_text(
-                    self._decode(parts[1]),
-                    self._decode(parts[2]),
-                    self._decode(parts[3]),
-                )
+                message,
+                kind=error_data["kind"],
+                backend_type=error_data["backend_type"],
+                backend_stack=error_data["backend_stack"],
             )
         raise JuliaProtocolError(f"unknown Julia response status: {status!r}")
+
+    def _mark_worker_dead(self) -> None:
+        proc = self._proc
+        self._proc = None
+        self._stderr_thread = None
+        self._pending_releases.clear()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+        if proc is not None:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(proc, stream_name)
+                if stream is not None:
+                    self._close_worker_stream(stream)
+
+    def _close_worker_stream(self, stream: Any) -> None:
+        try:
+            stream.close()
+        except BrokenPipeError as exc:
+            self._stderr.append(f"worker stream close hit broken pipe: {exc}\n")
 
     def _dead_process_message(self) -> str:
         message = "Julia bridge process exited unexpectedly"
@@ -358,7 +437,7 @@ class Julia:
                 for stream_name in ("stdin", "stdout", "stderr"):
                     stream = getattr(self._proc, stream_name)
                     if stream is not None:
-                        stream.close()
+                        self._close_worker_stream(stream)
                 self._proc = None
                 self._stderr_thread = None
 
