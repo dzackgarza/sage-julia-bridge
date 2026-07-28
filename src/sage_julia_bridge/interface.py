@@ -126,6 +126,30 @@ class JuliaHandle:
         values = self._operation("iterate")
         return iter(values)
 
+    def _binary(self, function: str, other: object) -> Any:
+        return self._bridge.call(function, self, other)
+
+    def __add__(self, other: object) -> Any:
+        return self._binary("+", other)
+
+    def __mul__(self, other: object) -> Any:
+        return self._binary("*", other)
+
+    def __truediv__(self, other: object) -> Any:
+        return self._binary("/", other)
+
+    def domain(self) -> Any:
+        return self._bridge.call("domain", self)
+
+    def codomain(self) -> Any:
+        return self._bridge.call("codomain", self)
+
+    def base_ring(self) -> Any:
+        return self._bridge.call("base_ring", self)
+
+    def parent(self) -> Any:
+        return self._bridge.call("parent", self)
+
     def __del__(self) -> None:
         # Only enqueue: sending a request here could interleave with an
         # in-flight request on the same pipe (GC runs at arbitrary points).

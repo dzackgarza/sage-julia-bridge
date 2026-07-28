@@ -457,15 +457,17 @@ using .Issue11RestartRuntime
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
         L, iota = prime_localization(R, R.ideal([x]))
-        local_element = iota(x + y)
+        local_element = iota(x)
         residue_field, rho = L.residue_field()
 
         self.assertIs(local_element.parent(), L)
         self.assertFalse(local_element.is_unit())
         self.assertTrue(iota(y).is_unit())
-        self.assertEqual(L.maximal_ideal(), R.ideal([x]).extension(L))
-        self.assertEqual(rho(local_element), residue_field.gen())
-        self.assertEqual(iota.oscar().domain().identity_key(), L.oscar().base_ring().identity_key())
+        self.assertEqual(L.maximal_ideal(), L.ideal([x]))
+        self.assertEqual(rho(local_element), residue_field.zero())
+        self.assertEqual(rho(iota(y)), residue_field.gen(1))
+        self.assertEqual(iota.oscar().domain(), R)
+        self.assertEqual(L.oscar().base_ring(), R)
 
 
 class Issue11GenericOscarSentinelTest(unittest.TestCase):
