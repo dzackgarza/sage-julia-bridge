@@ -14,6 +14,7 @@ from sage_julia_bridge import (
     JuliaProtocolError,
     SageOscarRealizationMap,
     batch_ref,
+    julia,
 )
 from sage_julia_bridge.interface import BridgeResponse
 
@@ -604,10 +605,14 @@ using .Issue11RestartRuntime
 
     def test_prime_localization_returns_native_sage_facade_objects(self) -> None:
         from sage.all import PolynomialRing
+        from sage.categories.fields import Fields
+        from sage.rings.ideal import Ideal_generic
+        from sage.rings.morphism import RingHomomorphism
 
         import sage_julia_bridge
 
         prime_localization = getattr(sage_julia_bridge, "prime_localization")
+        PrimeLocalRings = getattr(sage_julia_bridge, "PrimeLocalRings")
 
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
@@ -617,6 +622,17 @@ using .Issue11RestartRuntime
         residue_field, rho = L.residue_field()
 
         self.assertIsInstance(iota, SageOscarRealizationMap)
+        self.assertIsInstance(iota, RingHomomorphism)
+        self.assertIsInstance(L.maximal_ideal(), Ideal_generic)
+        self.assertIsInstance(rho, RingHomomorphism)
+        self.assertIn(L, PrimeLocalRings())
+        self.assertIn(residue_field, Fields())
+        self.assertIs(iota.domain(), R)
+        self.assertIs(iota.codomain(), L)
+        self.assertIs(rho.domain(), L)
+        self.assertIs(rho.codomain(), residue_field)
+        self.assertEqual(rho.kernel(), L.maximal_ideal())
+        self.assertTrue(rho.is_surjective())
         self.assertIs(local_element.parent(), L)
         self.assertFalse(local_element.is_unit())
         self.assertTrue(iota(y).is_unit())
@@ -625,6 +641,9 @@ using .Issue11RestartRuntime
         self.assertEqual(rho(iota(y)), residue_field.gen(1))
         self.assertEqual(iota.oscar().domain(), R)
         self.assertEqual(L.oscar().base_ring(), R)
+        self.assertEqual(L.maximal_ideal().oscar().base_ring(), L.oscar())
+        self.assertEqual(residue_field.oscar().base_ring(), R)
+        self.assertEqual(rho.oscar().domain(), L.oscar())
         self.assertTrue(local_sum.oscar().backend_equals(iota.oscar()(x + y)))
         self.assertEqual(iota(ZZ(3)), L(ZZ(3)))
 
@@ -667,6 +686,8 @@ using .Issue11RestartRuntime
         self.assertEqual(rho(iota(circle)), residue_field.zero())
         self.assertEqual(rho(local_fraction), residue_field(quotient(x + y)) / residue_field(quotient(y)))
         self.assertTrue(local_fraction.oscar().backend_equals(iota.oscar()(x + y) / iota.oscar()(y)))
+        self.assertEqual((rho * iota)(circle), residue_field.zero())
+        self.assertEqual(rho.kernel(), maximal)
 
         with self.assertRaises(ZeroDivisionError):
             L(x, circle)
@@ -695,6 +716,8 @@ using .Issue11RestartRuntime
         self.assertEqual(rho(two), residue_field(2))
         self.assertEqual(rho(five), residue_field.zero())
         self.assertEqual(residue_field.order(), ZZ(5))
+        self.assertEqual(rho.kernel(), maximal)
+        self.assertTrue(rho.is_surjective())
         self.assertEqual(iota.oscar().getproperty("domain"), ZZ)
         self.assertEqual(iota.oscar().getproperty("codomain").base_ring(), ZZ)
         self.assertEqual(L.oscar().base_ring(), ZZ)
@@ -704,6 +727,35 @@ using .Issue11RestartRuntime
             L(ZZ(1), ZZ(5))
         with self.assertRaises(ZeroDivisionError):
             five.inverse()
+
+    def test_localization_invalid_paths_are_typed_and_leave_worker_usable(self) -> None:
+        from sage.all import PolynomialRing
+
+        import sage_julia_bridge
+
+        prime_localization = getattr(sage_julia_bridge, "prime_localization")
+
+        R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
+        x, y = R.gens()
+        with self.assertRaises(ValueError):
+            prime_localization(R, R.ideal([x * y]))
+
+        L, iota = prime_localization(R, R.ideal([x]))
+        retained = iota(y).oscar()
+        retained.release()
+        with self.assertRaises(JuliaError) as released:
+            julia.call("is_unit", retained)
+        self.assertEqual(getattr(released.exception, "kind"), "released-object")
+
+        stale = iota(x).oscar()
+        old_pid = julia.sage("getpid()")
+        with self.assertRaises(JuliaError):
+            julia.eval("exit(86)")
+        self.assertNotEqual(julia.sage("getpid()"), old_pid)
+        with self.assertRaises(JuliaError) as stale_error:
+            julia.call("is_unit", stale)
+        self.assertEqual(getattr(stale_error.exception, "kind"), "stale-object")
+        self.assertEqual(julia.sage("6 * 7"), ZZ(42))
 
 
 class Issue11GenericOscarSentinelTest(unittest.TestCase):
