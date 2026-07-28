@@ -11,6 +11,7 @@ from sage_julia_bridge.interface import (
     julia,
 )
 from sage_julia_bridge.localization import prime_localization
+from sage_julia_bridge.realization import SageOscarRealizationMap
 
 __all__ = [
     "Julia",
@@ -19,6 +20,7 @@ __all__ = [
     "JuliaError",
     "JuliaHandle",
     "JuliaProtocolError",
+    "SageOscarRealizationMap",
     "batch_ref",
     "julia",
     "prime_localization",

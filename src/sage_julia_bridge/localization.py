@@ -8,19 +8,30 @@ from sage.categories.rings import Rings
 from sage.structure.element import Element
 from sage.structure.parent import Parent
 
+from sage_julia_bridge.errors import JuliaConversionError
 from sage_julia_bridge.interface import JuliaHandle, julia
+from sage_julia_bridge.realization import SageOscarRealizationMap, coerce_compatible_parent
 
 
 class PrimeLocalizationElement(Element):
     """Element of a prime-local Sage facade backed by an Oscar object."""
 
-    def __init__(self, parent: PrimeLocalizationParent, numerator: Any, denominator: Any | None = None) -> None:
+    def __init__(
+        self,
+        parent: PrimeLocalizationParent,
+        numerator: Any,
+        denominator: Any | None = None,
+        *,
+        oscar_value: JuliaHandle | None = None,
+    ) -> None:
         super().__init__(parent)
-        self._numerator = parent._base(numerator)
-        self._denominator = parent._base(1 if denominator is None else denominator)
+        self._numerator = coerce_compatible_parent(parent._base, numerator)
+        self._denominator = coerce_compatible_parent(parent._base, 1 if denominator is None else denominator)
         parent._assert_valid_denominator(self._denominator)
         self._fraction = parent._fraction_field(self._numerator) / parent._fraction_field(self._denominator)
-        self._oscar: JuliaHandle = parent._iota_oscar(self._numerator) / parent._iota_oscar(self._denominator)
+        self._oscar: JuliaHandle = (
+            oscar_value if oscar_value is not None and self._denominator == parent._base(1) else parent._iota_oscar(self._numerator) / parent._iota_oscar(self._denominator)
+        )
 
     def _repr_(self) -> str:
         if self._denominator == self.parent()._base(1):
@@ -105,7 +116,11 @@ class PrimeLocalizationParent(Parent):
     def _element_constructor_(self, numerator: Any, denominator: Any | None = None) -> PrimeLocalizationElement:
         if isinstance(numerator, PrimeLocalizationElement):
             if numerator.parent() is not self:
-                raise TypeError("cannot coerce an element from an incompatible prime localization")
+                raise JuliaConversionError(
+                    "cannot coerce an element from an incompatible prime localization",
+                    target=self,
+                    kind="parent-incompatible",
+                )
             if denominator is not None:
                 return cast(
                     PrimeLocalizationElement,
@@ -113,6 +128,9 @@ class PrimeLocalizationParent(Parent):
                 )
             return numerator
         return PrimeLocalizationElement(self, numerator, denominator)
+
+    def _from_base_realization(self, value: Any, oscar_value: JuliaHandle) -> PrimeLocalizationElement:
+        return PrimeLocalizationElement(self, value, oscar_value=oscar_value)
 
     def _assert_valid_denominator(self, denominator: Any) -> None:
         if denominator in self._prime:
@@ -142,25 +160,11 @@ class PrimeLocalizationParent(Parent):
         return field, PrimeLocalizationResidueMap(self, field, quotient)
 
 
-class PrimeLocalizationMap:
+class PrimeLocalizationMap(SageOscarRealizationMap):
     """Sage-callable localization map retaining the Oscar map."""
 
     def __init__(self, domain: Any, codomain: PrimeLocalizationParent, oscar_map: JuliaHandle) -> None:
-        self._domain = domain
-        self._codomain = codomain
-        self._oscar_map = oscar_map
-
-    def domain(self) -> Any:
-        return self._domain
-
-    def codomain(self) -> PrimeLocalizationParent:
-        return self._codomain
-
-    def __call__(self, value: Any) -> PrimeLocalizationElement:
-        return cast(PrimeLocalizationElement, self._codomain(value))
-
-    def oscar(self) -> JuliaHandle:
-        return self._oscar_map
+        super().__init__(domain, codomain, oscar_map, codomain._from_base_realization)
 
 
 class PrimeLocalizationResidueMap:

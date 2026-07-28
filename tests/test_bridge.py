@@ -12,6 +12,7 @@ from sage_julia_bridge import (
     JuliaError,
     JuliaHandle,
     JuliaProtocolError,
+    SageOscarRealizationMap,
     batch_ref,
 )
 from sage_julia_bridge.interface import BridgeResponse
@@ -612,8 +613,10 @@ using .Issue11RestartRuntime
         x, y = R.gens()
         L, iota = prime_localization(R, R.ideal([x]))
         local_element = iota(x)
+        local_sum = iota(x + y)
         residue_field, rho = L.residue_field()
 
+        self.assertIsInstance(iota, SageOscarRealizationMap)
         self.assertIs(local_element.parent(), L)
         self.assertFalse(local_element.is_unit())
         self.assertTrue(iota(y).is_unit())
@@ -622,6 +625,16 @@ using .Issue11RestartRuntime
         self.assertEqual(rho(iota(y)), residue_field.gen(1))
         self.assertEqual(iota.oscar().domain(), R)
         self.assertEqual(L.oscar().base_ring(), R)
+        self.assertTrue(local_sum.oscar().backend_equals(iota.oscar()(x + y)))
+        self.assertEqual(iota(ZZ(3)), L(ZZ(3)))
+
+        S = PolynomialRing(QQ, ["u", "v"], order="degrevlex")
+        with self.assertRaises(JuliaConversionError) as map_raised:
+            iota(S.gen(0))
+        self.assertEqual(getattr(map_raised.exception, "kind"), "parent-incompatible")
+        with self.assertRaises(JuliaConversionError) as constructor_raised:
+            L(S.gen(0))
+        self.assertEqual(getattr(constructor_raised.exception, "kind"), "parent-incompatible")
 
 
 class Issue11GenericOscarSentinelTest(unittest.TestCase):
