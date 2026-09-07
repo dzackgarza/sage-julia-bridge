@@ -46,7 +46,7 @@ just setup
 Or install just the Python package into Sage's environment:
 
 ```bash
-sage -python -m pip install -e .
+uv pip install --python "$(sage -c 'import sys; print(sys.executable)')" --no-deps -e .
 ```
 
 ## Use

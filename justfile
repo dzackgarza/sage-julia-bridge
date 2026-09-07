@@ -43,7 +43,10 @@ preflight:
 
 # Install the bridge into Sage's Python environment.
 install:
-    sage -python -m pip install -e .
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sage_python="$(sage -c 'import sys; print(sys.executable)')"
+    uv pip install --python "${sage_python}" --no-deps -e .
 
 # Resolve the transport and Oscar in the worker project, then verify they load together.
 julia-deps:
