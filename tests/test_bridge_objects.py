@@ -12,9 +12,11 @@ from sage_julia_bridge import (
     JuliaReleasedObjectError,
     JuliaStaleObjectError,
     JuliaWorkerError,
+    PrimeLocalRings,
     SageOscarRealizationMap,
     batch_ref,
     julia,
+    prime_localization,
 )
 from sage_julia_bridge.interface import BridgeResponse
 
@@ -143,20 +145,20 @@ using .Issue11ReleaseRuntime
             self.assertEqual(second.introspect()["retained_references"], ZZ(1))
             with self.assertRaises(JuliaReleasedObjectError) as released:
                 first.sage()
-            self.assertEqual(getattr(released.exception, "kind"), "released-object")
+            self.assertEqual(released.exception.kind, "released-object")
             second.release()
             second.release()
             with self.assertRaises(JuliaReleasedObjectError) as again_released:
                 second.getproperty("value")
-            self.assertEqual(getattr(again_released.exception, "kind"), "released-object")
+            self.assertEqual(again_released.exception.kind, "released-object")
 
     def test_conversion_refusal_leaves_foreign_object_usable(self) -> None:
         box = self.bridge.sage("Box(13)")
 
         with self.assertRaises(JuliaConversionError) as raised:
             box.sage()
-        self.assertEqual(getattr(raised.exception, "kind"), "conversion-refused")
-        self.assertEqual(getattr(raised.exception, "backend_type"), "Box")
+        self.assertEqual(raised.exception.kind, "conversion-refused")
+        self.assertEqual(raised.exception.backend_type, "Box")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(13))
 
     def test_target_directed_sage_conversion_registry(self) -> None:
@@ -168,7 +170,7 @@ using .Issue11ReleaseRuntime
         self.assertEqual(box.sage(target), ZZ(19))
         with self.assertRaises(JuliaConversionError) as raised:
             box.sage(("issue-11", "unregistered"))
-        self.assertEqual(getattr(raised.exception, "kind"), "conversion-refused")
+        self.assertEqual(raised.exception.kind, "conversion-refused")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(19))
 
     def test_outbound_conversion_registry_is_recursive(self) -> None:
@@ -189,10 +191,10 @@ using .Issue11ReleaseRuntime
 
         with self.assertRaises(JuliaError) as raised:
             self.bridge.call("explode_structured", box)
-        self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
+        self.assertEqual(raised.exception.backend_type, "DomainError")
         with self.assertRaises(JuliaDispatchError) as dispatch:
             self.bridge.call("sin", box)
-        self.assertEqual(getattr(dispatch.exception, "backend_type"), "MethodError")
+        self.assertEqual(dispatch.exception.backend_type, "MethodError")
         self.assertEqual(self.bridge.call("box_value", box), ZZ(23))
 
     def test_structured_batch_preserves_intermediate_identity_in_one_request(self) -> None:
@@ -241,7 +243,7 @@ using .Issue11BatchRuntime
 
             with self.assertRaises(JuliaError) as raised:
                 bridge.batch([{"op": "call", "function": "explode_structured", "args": [box]}])
-            self.assertEqual(getattr(raised.exception, "backend_type"), "DomainError")
+            self.assertEqual(raised.exception.backend_type, "DomainError")
             self.assertEqual(bridge.call("box_value", box), ZZ(29))
         finally:
             bridge.quit()
@@ -269,7 +271,7 @@ using .Issue11RestartRuntime
             self.assertNotEqual(new_pid, old_pid)
             with self.assertRaises(JuliaStaleObjectError) as raised:
                 stale.getproperty("value")
-            self.assertEqual(getattr(raised.exception, "kind"), "stale-object")
+            self.assertEqual(raised.exception.kind, "stale-object")
             self.assertEqual(bridge.sage("1 + 1"), ZZ(2))
 
     def test_prime_localization_returns_native_sage_facade_objects(self) -> None:
@@ -277,11 +279,6 @@ using .Issue11RestartRuntime
         from sage.categories.fields import Fields
         from sage.rings.ideal import Ideal_generic
         from sage.rings.morphism import RingHomomorphism
-
-        import sage_julia_bridge
-
-        prime_localization = getattr(sage_julia_bridge, "prime_localization")
-        PrimeLocalRings = getattr(sage_julia_bridge, "PrimeLocalRings")
 
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
@@ -318,17 +315,13 @@ using .Issue11RestartRuntime
         S = PolynomialRing(QQ, ["u", "v"], order="degrevlex")
         with self.assertRaises(JuliaConversionError) as map_raised:
             iota(S.gen(0))
-        self.assertEqual(getattr(map_raised.exception, "kind"), "parent-incompatible")
+        self.assertEqual(map_raised.exception.kind, "parent-incompatible")
         with self.assertRaises(JuliaConversionError) as constructor_raised:
             L(S.gen(0))
-        self.assertEqual(getattr(constructor_raised.exception, "kind"), "parent-incompatible")
+        self.assertEqual(constructor_raised.exception.kind, "parent-incompatible")
 
     def test_noncoordinate_prime_localization_residue_and_ideal_workflow(self) -> None:
         from sage.all import PolynomialRing
-
-        import sage_julia_bridge
-
-        prime_localization = getattr(sage_julia_bridge, "prime_localization")
 
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
@@ -363,9 +356,6 @@ using .Issue11RestartRuntime
             iota(circle).inverse()
 
     def test_integer_prime_localization_uses_retained_oscar_local_ring(self) -> None:
-        import sage_julia_bridge
-
-        prime_localization = getattr(sage_julia_bridge, "prime_localization")
 
         L, iota = prime_localization(ZZ, ZZ.ideal(5))
         maximal = L.maximal_ideal()
@@ -399,10 +389,6 @@ using .Issue11RestartRuntime
     def test_localization_invalid_paths_are_typed_and_leave_worker_usable(self) -> None:
         from sage.all import PolynomialRing
 
-        import sage_julia_bridge
-
-        prime_localization = getattr(sage_julia_bridge, "prime_localization")
-
         R = PolynomialRing(QQ, ["x", "y"], order="degrevlex")
         x, y = R.gens()
         with self.assertRaises(ValueError):
@@ -413,7 +399,7 @@ using .Issue11RestartRuntime
         retained.release()
         with self.assertRaises(JuliaError) as released:
             julia.call("is_unit", retained)
-        self.assertEqual(getattr(released.exception, "kind"), "released-object")
+        self.assertEqual(released.exception.kind, "released-object")
 
         stale = iota(x).oscar()
         old_pid = julia.sage("getpid()")
@@ -422,7 +408,7 @@ using .Issue11RestartRuntime
         self.assertNotEqual(julia.sage("getpid()"), old_pid)
         with self.assertRaises(JuliaError) as stale_error:
             julia.call("is_unit", stale)
-        self.assertEqual(getattr(stale_error.exception, "kind"), "stale-object")
+        self.assertEqual(stale_error.exception.kind, "stale-object")
         self.assertEqual(julia.sage("6 * 7"), ZZ(42))
 
 
