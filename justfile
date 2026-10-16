@@ -45,17 +45,11 @@ preflight:
 install:
     sage -python -m pip install -e .
 
-# Instantiate the Julia environments (bridge project + shared env artifacts)
-# and verify the worker's dependencies and Oscar load together.
+# Resolve the transport and Oscar in the worker project, then verify they load together.
 julia-deps:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{justfile_directory()}}
-    julia --startup-file=no --history-file=no --color=no -e '
-        using Pkg
-        Pkg.instantiate()
-        Pkg.precompile()
-    '
     julia --project=src/sage_julia_bridge/julia_env --startup-file=no --history-file=no --color=no -e '
         using Pkg
         Pkg.instantiate()
