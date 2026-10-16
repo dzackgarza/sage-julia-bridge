@@ -14,3 +14,6 @@ codeql-report.sarif
 models/
 src/sage_julia_bridge/julia_env/Manifest.toml
 *.sage.py
+
+# Home-mounted scratch for the Docker-backed Sage launcher.
+.tmp/
