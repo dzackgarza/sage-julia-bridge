@@ -46,7 +46,7 @@ install:
     #!/usr/bin/env bash
     set -euo pipefail
     sage_python="$(sage -c 'import sys; print(sys.executable)')"
-    uv pip install --python "${sage_python}" --no-deps -e .
+    uv pip install --python "${sage_python}" -e .
 
 # Resolve the transport and Oscar in the worker project, then verify they load together.
 julia-deps:
