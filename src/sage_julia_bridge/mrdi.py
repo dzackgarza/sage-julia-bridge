@@ -34,7 +34,7 @@ from sage.structure.element import Matrix
 from sage_julia_bridge.errors import JuliaProtocolError
 
 OSCAR_NS_URL = "https://github.com/oscar-system/Oscar.jl"
-OSCAR_NS_VERSION = "1.7.1"
+OSCAR_NS_VERSION = "1.8.2"
 
 # The wire format does not carry generator names for extension fields; the
 # reconstruction name is pinned here (docs/wire-format.md).

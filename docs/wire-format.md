@@ -59,7 +59,7 @@ No parent is ever inferred from container entries — the `int`/`rational` entri
 ## mrdi subset
 
 The `mrdi` node is an explicit value-conversion mechanism, not an object-admission gate.
-It carries an Oscar serialization document (`_ns`/`_type`/`data`/`_refs`) pinned to `_ns = {"Oscar": [..., "1.7.1"]}`. The Sage decoder rejects other namespaces and versions.
+It carries an Oscar serialization document (`_ns`/`_type`/`data`/`_refs`) pinned to `_ns = {"Oscar": [..., "1.8.2"]}`. The Sage decoder rejects other namespaces and versions.
 The admissible `_type` names — everywhere in the document, including `_refs` — are exactly:
 
 ```

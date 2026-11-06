@@ -370,7 +370,7 @@ function capture(f)
     )
 end
 
-function evaluate(code::AbstractString)
+function bridge_evaluate(code::AbstractString)
     return capture(() -> Base.include_string(Main, code, "sage_julia_bridge"))
 end
 
@@ -487,10 +487,10 @@ function handle_request(op::String, payload::String)
         payload = hello_payload()
         return (payload, "{\"type\":\"string\",\"value\":" * json_string(payload) * "}", "", "")
     elseif op == "exec"
-        value, stdout_text, stderr_text = evaluate(payload)
+        value, stdout_text, stderr_text = bridge_evaluate(payload)
         return (display_text(value), NOTHING_NODE, stdout_text, stderr_text)
     elseif op == "value"
-        value, stdout_text, stderr_text = evaluate(payload)
+        value, stdout_text, stderr_text = bridge_evaluate(payload)
         return (display_text(value), encode_value(value, true), stdout_text, stderr_text)
     elseif op == "resolve"
         value, stdout_text, stderr_text = capture(() -> resolve_path(payload))

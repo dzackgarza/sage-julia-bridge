@@ -211,7 +211,7 @@ class MrdiCodecTest(unittest.TestCase):
         from sage_julia_bridge.mrdi import decode_mrdi
 
         doc = {
-            "_ns": {"Oscar": ["https://github.com/oscar-system/Oscar.jl", "1.7.1"]},
+            "_ns": {"Oscar": ["https://github.com/oscar-system/Oscar.jl", "1.8.2"]},
             "_type": {"name": "PadicField", "params": {"_type": "PadicField"}},
             "data": "1",
         }
@@ -222,7 +222,7 @@ class MrdiCodecTest(unittest.TestCase):
         from sage_julia_bridge.mrdi import decode_mrdi
 
         doc = {
-            "_ns": {"Oscar": ["https://github.com/oscar-system/Oscar.jl", "1.7.1"]},
+            "_ns": {"Oscar": ["https://github.com/oscar-system/Oscar.jl", "1.8.2"]},
             "_type": {"name": "FqFieldElem", "params": "not-a-real-ref"},
             "data": "3",
         }
