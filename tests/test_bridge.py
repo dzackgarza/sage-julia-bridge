@@ -349,8 +349,11 @@ class ProtocolTest(unittest.TestCase):
             self.assertEqual(handle.introspect()["retained_references"], ZZ(1))
             del handle
             gc.collect()
-            with self.assertRaisesRegex(JuliaError, "unknown handle id"):
+            with self.assertRaises(JuliaError) as raised:
                 bridge._request("object", json.dumps({"op": "introspect", "id": handle_id}))
+            self.assertEqual(raised.exception.kind, "backend")
+            self.assertEqual(raised.exception.backend_type, "ErrorException")
+            self.assertEqual(bridge.sage("6 * 7"), ZZ(42))
 
     def test_stale_handle_rejected_after_restart(self) -> None:
         # Ids restart from 1 with a new worker; a handle from a previous
