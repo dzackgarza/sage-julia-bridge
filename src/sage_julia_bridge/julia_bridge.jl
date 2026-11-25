@@ -2,7 +2,7 @@ using Base64
 import JSON
 
 for adapter in filter(path -> endswith(path, "_backend.jl"), readdir(@__DIR__; join=true))
-    include(adapter)
+    Base.include(@__MODULE__, adapter)
 end
 
 const BRIDGE_PROTOCOL_VERSION = 1
@@ -326,10 +326,10 @@ end
 
 # Values are never interpolated into source: a function path is resolved as a
 # chain of symbol lookups, which cannot execute code.
-function resolve_path(path::AbstractString)
+function resolve_path(path::AbstractString, root::Module=Main)
     parts = split(path, '.')
     all(!isempty, parts) || error("invalid function path: ", path)
-    obj = Main
+    obj = root
     for part in parts
         obj = getproperty(obj, Symbol(part))
     end
@@ -505,9 +505,10 @@ function handle_request(op::String, payload::String)
         # verbatim data; it is never parsed or evaluated as code.
         Core.eval(Main, Expr(:(=), name, QuoteNode(value)))
         return ("", NOTHING_NODE, "", "")
-    elseif op == "call"
+    elseif op == "call" || op == "backend_call"
         request = JSON.parse(payload)
-        f = resolve_path(request["function"]::String)
+        root = op == "call" ? Main : @__MODULE__
+        f = resolve_path(request["function"]::String, root)
         args = Any[decode_value(item) for item in request["args"]]
         kwargs = Pair{Symbol,Any}[Symbol(key) => decode_value(item) for (key, item) in request["kwargs"]]
         value, stdout_text, stderr_text = capture(() -> f(args...; kwargs...))

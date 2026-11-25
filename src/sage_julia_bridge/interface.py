@@ -234,7 +234,7 @@ class Julia:
 
     def __init__(self, command: str | None = None) -> None:
         self._command = command or self._default_command()
-        self._bridge = Path(__file__).with_name("julia_bridge.jl")
+        self._bridge = Path(__file__).with_name("julia_worker.jl")
         self._session_id = str(uuid.uuid4())
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.RLock()
@@ -579,6 +579,12 @@ class Julia:
         return self.sage(var)
 
     def call(self, function: str, *args: object, **kwds: object) -> Any:
+        return self._call("call", function, args, kwds)
+
+    def _call_backend(self, function: str, *args: object, **kwds: object) -> Any:
+        return self._call("backend_call", function, args, kwds)
+
+    def _call(self, op: str, function: str, args: tuple[object, ...], kwds: dict[str, object]) -> Any:
         payload = json.dumps(
             {
                 "function": function,
@@ -586,7 +592,7 @@ class Julia:
                 "kwargs": {key: self._encode_value(value) for key, value in kwds.items()},
             }
         )
-        response = self._request("call", payload)
+        response = self._request(op, payload)
         return self._decode_value(response.structured, response.display)
 
     def batch(self, steps: list[dict[str, Any]]) -> Any:

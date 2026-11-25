@@ -13,7 +13,7 @@ end
 bridge_localized_ideal(ring, generators) = BridgeLocalizedIdeal(ring, generators)
 
 function bridge_fraction_residue_map(domain, codomain, base_map)
-    return map_from_func(
+    return Main.Oscar.map_from_func(
         domain,
         codomain,
         value -> begin

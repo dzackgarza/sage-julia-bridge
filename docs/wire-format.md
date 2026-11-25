@@ -7,6 +7,8 @@ Display text never establishes identity or conversion.
 ## Protocol framing
 
 One request occupies one line on the worker's stdin: `op \t base64(payload)`. Protocol version 1 negotiates capabilities with `hello` before ordinary requests.
+The worker entry point `julia_worker.jl` loads the kernel into a module with no binding in the user evaluation module `Main`.
+Public evaluation, assignment and symbol lookup operate in `Main`; internal domain adapters use the private `backend_call` operation, which resolves names in the kernel module instead.
 Operations include `exec`, `value`, `resolve`, `set`, `call`, `call_object`, `object`, `batch`, `materialize`, `release`, `ping`, and `quit`.
 
 A successful reply is `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)`. An error reply is `err \t b64(json_error) \t b64(stdout) \t b64(stderr)`. The JSON error carries `kind`, Julia exception type, message, and backend stack.
