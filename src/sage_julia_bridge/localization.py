@@ -110,10 +110,10 @@ class PrimeLocalizationIdeal(Ideal_generic):
 
         Ideal_generic.__init__(self, ring, generators)
         self._base_ideal = ring._base.ideal([generator.numerator() for generator in self.gens()])
-        constructor = "bridge_localized_ideal" if ring._base is ZZ else "ideal"
+        args = (ring.oscar(), [generator.oscar() for generator in self.gens()])
         self._oscar = cast(
             JuliaHandle,
-            julia.call(constructor, ring.oscar(), [generator.oscar() for generator in self.gens()]),
+            julia._call_backend("bridge_localized_ideal", *args) if ring._base is ZZ else julia.call("ideal", *args),
         )
 
     def oscar(self) -> JuliaHandle:
@@ -346,7 +346,7 @@ def _oscar_residue_realization(
             localization._base,
             localization._prime.gen(),
         )
-        oscar_map = julia.call(
+        oscar_map = julia._call_backend(
             "bridge_fraction_residue_map",
             localization.oscar(),
             oscar_field,
@@ -361,7 +361,7 @@ def _oscar_residue_realization(
     )
     quotient_ring, quotient_map = julia.call("quo", localization._base, oscar_prime)
     oscar_field = julia.call("fraction_field", quotient_ring)
-    oscar_map = julia.call(
+    oscar_map = julia._call_backend(
         "bridge_fraction_residue_map",
         localization.oscar(),
         oscar_field,
@@ -386,7 +386,7 @@ def prime_localization(base: Any, prime: Any) -> tuple[PrimeLocalizationParent, 
         if len(prime_generators) != 1:
             raise ValueError("ZZ prime localization requires one principal generator")
         oscar_ring = julia.call("localization", base, prime_generators[0])
-        oscar_iota = julia.call("BridgeCoercionMap", base, oscar_ring)
+        oscar_iota = julia._call_backend("BridgeCoercionMap", base, oscar_ring)
         localization = PrimeLocalizationParent(base, prime, oscar_ring, oscar_iota)
         return localization, PrimeLocalizationMap(base, localization, oscar_iota)
 

@@ -238,6 +238,32 @@ class JuliaBridgeTest(unittest.TestCase):
                 else:
                     os.environ[name] = value
 
+    def test_worker_names_do_not_shadow_user_exports(self) -> None:
+        names = (
+            "json_escape", "capture", "reply", "b64", "display_text", "resolve_path",
+            "encode_value", "decode_value", "bridge_evaluate", "JSON", "Base64",
+            "HANDLES", "BRIDGE_CAPABILITIES", "BridgeCoercionMap", "BridgeLocalizedIdeal",
+            "bridge_localized_ideal", "bridge_fraction_residue_map", "SageJuliaBridgeKernel",
+        )
+        exports = ", ".join(names)
+        definitions = "; ".join(f"{name}() = {i}" for i, name in enumerate(names, 1))
+        self.bridge.eval(f"module Probe; export {exports}; {definitions}; end")
+        self.assertEqual(self.bridge.eval("using .Probe"), "")
+        self.assertEqual(
+            self.bridge.sage("(" + ", ".join(f"{name}()" for name in names) + ")"),
+            list(range(1, len(names) + 1)),
+        )
+        self.assertEqual(self.bridge.call("capture"), 2)
+        self.assertEqual(self.bridge.resolve("reply")(), 3)
+
+    def test_conflicts_between_user_modules_retain_julia_semantics(self) -> None:
+        self.bridge.eval("module A; export probe; probe() = 1; end")
+        self.bridge.eval("module B; export probe; probe() = 2; end")
+        self.bridge.eval("using .A, .B")
+        with self.assertRaises(JuliaError):
+            self.bridge.sage("probe()")
+        self.assertEqual(self.bridge.sage("(A.probe(), B.probe())"), [1, 2])
+
     def test_oscar_loads(self) -> None:
         self.assertEqual(self.bridge.eval("using Oscar"), "")
         oscar_code = """begin
@@ -319,10 +345,15 @@ class ProtocolTest(unittest.TestCase):
 
         with Julia() as bridge:
             handle = bridge.sage("x -> x")
-            self.assertEqual(bridge.sage("length(HANDLES)"), ZZ(1))
+            handle_id = handle.identity_key()[2]
+            self.assertEqual(handle.introspect()["retained_references"], ZZ(1))
             del handle
             gc.collect()
-            self.assertEqual(bridge.sage("length(HANDLES)"), ZZ(0))
+            with self.assertRaises(JuliaError) as raised:
+                bridge._request("object", json.dumps({"op": "introspect", "id": handle_id}))
+            self.assertEqual(raised.exception.kind, "backend")
+            self.assertEqual(raised.exception.backend_type, "ErrorException")
+            self.assertEqual(bridge.sage("6 * 7"), ZZ(42))
 
     def test_stale_handle_rejected_after_restart(self) -> None:
         # Ids restart from 1 with a new worker; a handle from a previous
@@ -332,8 +363,10 @@ class ProtocolTest(unittest.TestCase):
 
         with Julia() as bridge:
             stale = bridge.sage("x -> 10 * x")
+            stale_id = stale.identity_key()[2]
             bridge.quit()
             fresh = bridge.sage("x -> 2 * x")  # restarts worker, id 1 again
+            self.assertEqual(fresh.identity_key()[2], stale_id)
             with self.assertRaises(JuliaError):
                 bridge.call("map", stale, [ZZ(1), ZZ(2)])
             with self.assertRaises(JuliaError):
@@ -341,7 +374,7 @@ class ProtocolTest(unittest.TestCase):
             # A stale handle's GC must not release the new worker's entry.
             del stale
             gc.collect()
-            self.assertEqual(bridge.sage("length(HANDLES)"), ZZ(1))
+            self.assertEqual(fresh.introspect()["retained_references"], ZZ(1))
             result = bridge.call("map", fresh, [ZZ(1), ZZ(2)])
             self.assertEqual(result, [ZZ(2), ZZ(4)])
 
