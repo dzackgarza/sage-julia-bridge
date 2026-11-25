@@ -1,6 +1,3 @@
-# sage-julia-bridge - QC delegation (contract: ~/ai-review-ci/justfiles/sage.just setup)
-
-# ai-review-ci contract variables consumed by doctor and workflow installers.
 ai_review_ci_schema_version := "1"
 ai_review_ci_profile := "sage"
 ai_review_ci_ref := "main"
@@ -9,25 +6,29 @@ ai_review_ci_workflow_template_version := "1"
 ai_review_ci_local_delegation := "global-justfile"
 ai_review_ci_default_branch := "main"
 
+[doc("List available recipes")]
 default:
     @just --list
 
-# Three-tier QC per the ai-review-ci Sage wiring contract.
+[doc("Run the commit-tier QC gate")]
 test-commit:
     @just -f ~/ai-review-ci/justfiles/sage.just -d . test-commit
 
+[doc("Run the push-tier QC gate")]
 test-push:
     @just -f ~/ai-review-ci/justfiles/sage.just -d . test-push
 
+[doc("Run the CI-tier QC gate")]
 test-ci:
     @just -f ~/ai-review-ci/justfiles/sage.just -d . test-ci
 
+[doc("Run the push-tier QC gate")]
 test: test-push
 
-# Full bootstrap: Python package into Sage + Julia deps/artifacts + Oscar verification.
+[doc("Full bootstrap: Python package into Sage + Julia deps/artifacts + Oscar verification.")]
 setup: preflight install julia-deps
 
-# Assert required base toolchains are on PATH; fail loudly if any is missing.
+[doc("Assert required base toolchains are on PATH; fail loudly if any is missing.")]
 preflight:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -41,14 +42,14 @@ preflight:
     fi
     echo "preflight ok: sage julia uv"
 
-# Install the bridge into Sage's Python environment.
+[doc("Install the bridge into Sage's Python environment.")]
 install:
     #!/usr/bin/env bash
     set -euo pipefail
     sage_python="$(sage -c 'import sys; print(sys.executable)')"
     uv pip install --python "${sage_python}" -e .
 
-# Resolve the transport and Oscar in the worker project, then verify they load together.
+[doc("Resolve the transport and Oscar in the worker project, then verify they load together.")]
 julia-deps:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -62,9 +63,10 @@ julia-deps:
         println("JSON ", pkgversion(JSON), ", Oscar ", Oscar.VERSION_NUMBER, " loaded")
     '
 
+[doc("Build the source and wheel distributions")]
 build:
     uv build
 
-# Run the scheduled whole-tree audit (semgrep and debt scans) through the central implementation.
+[doc("Run the scheduled whole-tree audit (semgrep and debt scans) through the central implementation.")]
 ambient:
     @just -f ~/ai-review-ci/justfiles/sage.just -d . ambient
