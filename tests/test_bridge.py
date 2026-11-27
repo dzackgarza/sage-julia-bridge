@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -163,6 +170,88 @@ class JuliaBridgeTest(unittest.TestCase):
             with self.assertRaises(JuliaError):
                 bridge.eval("ccall(:_exit, Cvoid, (Cint,), 86)")
             self.assertEqual(bridge.eval("1 + 1"), "2")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux process identity check uses pidfds and /proc")
+    def test_worker_dies_with_owner(self) -> None:
+        # Exercise the real Julia process, not a protocol shim. An idle
+        # worker can notice EOF; a worker in an outstanding request cannot.
+        owner_code = """
+import json, sys, threading, time
+import sage.all
+from sage_julia_bridge import Julia
+
+bridge = Julia()
+starter = threading.Thread(target=lambda: print(bridge.eval('getpid()'), flush=True))
+starter.start()
+starter.join()
+if sys.argv[1] == 'busy':
+    marker = json.dumps(sys.argv[2])
+    bridge.eval(f'write({marker}, "started"); while true; sleep(1); end')
+else:
+    time.sleep(600)
+"""
+        for state in ("idle", "busy"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                marker = Path(directory) / "started"
+                owner = subprocess.Popen(
+                    [sys.executable, "-u", "-c", owner_code, state, str(marker)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=True,
+                )
+                worker_fd = None
+                supervisor_fd = None
+                try:
+                    assert owner.stdout is not None
+                    self.assertTrue(select.select([owner.stdout], [], [], 90)[0], "owner did not report its Julia PID")
+                    line = owner.stdout.readline()
+                    self.assertTrue(line.strip().isdigit(), f"owner did not report a PID: {line!r}")
+                    worker_pid = int(line)
+                    worker_fd = os.pidfd_open(worker_pid)
+                    worker_status = Path(f"/proc/{worker_pid}/status").read_text()
+                    worker_parent = int(worker_status.split("PPid:\t", 1)[1].splitlines()[0])
+                    if worker_parent != owner.pid:
+                        supervisor_status = Path(f"/proc/{worker_parent}/status").read_text()
+                        self.assertEqual(int(supervisor_status.split("PPid:\t", 1)[1].splitlines()[0]), owner.pid)
+                        supervisor_fd = os.pidfd_open(worker_parent)
+                    if state == "busy":
+                        deadline = time.monotonic() + 30
+                        while (not marker.exists() or not marker.stat().st_size) and time.monotonic() < deadline:
+                            time.sleep(0.05)
+                        self.assertEqual(marker.read_text(), "started")
+                    worker_exit = select.poll()
+                    worker_exit.register(worker_fd, select.POLLIN)
+                    self.assertEqual(worker_exit.poll(0), [])
+                    owner.kill()  # SIGKILL: no Python teardown or atexit.
+                    self.assertEqual(owner.wait(timeout=10), -signal.SIGKILL)
+                    self.assertTrue(worker_exit.poll(5000), f"{state} Julia worker {worker_pid} survived its owner")
+                    if supervisor_fd is not None:
+                        supervisor_exit = select.poll()
+                        supervisor_exit.register(supervisor_fd, select.POLLIN)
+                        self.assertTrue(supervisor_exit.poll(5000), "worker supervisor survived its owner")
+                finally:
+                    if owner.poll() is None:
+                        os.killpg(owner.pid, signal.SIGKILL)
+                        owner.wait(timeout=10)
+                    if worker_fd is not None:
+                        try:
+                            signal.pidfd_send_signal(worker_fd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        finally:
+                            os.close(worker_fd)
+                    if supervisor_fd is not None:
+                        try:
+                            signal.pidfd_send_signal(supervisor_fd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        finally:
+                            os.close(supervisor_fd)
+                    owner.communicate(timeout=10)
+        # A new owner-independent session remains usable after hard exits.
+        with Julia() as fresh:
+            self.assertEqual(fresh.eval("1 + 1"), "2")
 
     def test_protocol_violations_raise(self) -> None:
         # A real subprocess speaking broken protocol over real pipes: the

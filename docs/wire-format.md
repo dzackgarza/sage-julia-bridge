@@ -14,6 +14,8 @@ Operations include `exec`, `value`, `resolve`, `set`, `call`, `call_object`, `ob
 A successful reply is `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)`. An error reply is `err \t b64(json_error) \t b64(stdout) \t b64(stderr)`. The JSON error carries `kind`, Julia exception type, message, and backend stack.
 Protocol violations, conversion refusal, parent incompatibility, released objects, stale objects, backend dispatch, and worker death remain distinguishable.
 
+On POSIX, the Python client owns each worker through a process-associated record lock on a private temporary file. The separate supervisor holds an inherited descriptor, not the lock: POSIX record locks are released on owner-process exit and are not inherited by forked children. The supervisor tests for release before starting Julia and while waiting for its exit. Once released, it kills and reaps the worker even during a request that cannot read protocol EOF. It lives in a different process group from the client, while Julia retains the client's original group. The supervisor does not retain the protocol pipes after launching Julia. Explicit `quit` still uses the protocol; forced cleanup releases the same ownership lock. The original process-associated lock also avoids tying worker lifetime to the transient Python thread that started it.
+
 ## Retained-object runtime
 
 A `handle` node identifies one worker-owned Julia value.
