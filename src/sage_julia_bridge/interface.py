@@ -96,8 +96,6 @@ class JuliaHandle:
         return f"JuliaHandle<{self._julia_type}>({self._display})"
 
     def _assert_current(self) -> None:
-        # Ids restart with each worker process; a stale id would silently
-        # resolve to a different object in the new worker's table.
         if self._generation != self._bridge._generation:
             raise JuliaStaleObjectError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
         if self._released:
@@ -226,9 +224,7 @@ class JuliaHandle:
         return self._bridge.call("parent", self)
 
     def __del__(self) -> None:
-        # Only enqueue: sending a request here could interleave with an
-        # in-flight request on the same pipe (GC runs at arbitrary points).
-        # Stale handles enqueue nothing: the value died with its worker.
+        """Queue current-generation releases without interrupting protocol traffic."""
         if not self._released and self._generation == self._bridge._generation:
             self._bridge._pending_releases.append(self._id)
 
@@ -292,9 +288,6 @@ class Julia:
             if self._proc.poll() is None:
                 return
             self._mark_worker_dead()
-        # The bridge's own Julia deps (JSON) live in a repo-scoped project;
-        # Julia's default load-path stacking keeps shared-env packages such
-        # as Oscar loadable alongside it.
         julia_env = Path(__file__).with_name("julia_env")
         argv = self._command_argv() + [
             f"--project={julia_env}",
@@ -304,7 +297,6 @@ class Julia:
             str(self._bridge),
         ]
         self._stderr.clear()
-        # Handle ids die with the worker process they belong to.
         self._pending_releases.clear()
         self._generation += 1
         owner_lock = tempfile.TemporaryFile()
@@ -312,7 +304,7 @@ class Julia:
             fcntl.lockf(owner_lock, fcntl.LOCK_EX)
             supervisor = Path(__file__).with_name("_worker_supervisor.py")
             self._proc = subprocess.Popen(
-                [sys.executable, "-I", str(supervisor), str(owner_lock.fileno()), str(os.getpgrp()), *argv],
+                [sys.executable, "-I", str(supervisor), str(owner_lock.fileno()), *argv],
                 pass_fds=(owner_lock.fileno(),),
                 process_group=0,
                 stdin=subprocess.PIPE,
@@ -447,9 +439,6 @@ class Julia:
             return {"type": "bool", "value": value}
         if isinstance(value, str):
             return {"type": "string", "value": value}
-        # Parent-carrying algebra travels as mrdi. This runs before the
-        # numeric branches so e.g. GF(p) elements can never be flattened
-        # to bare integers by a numbers-ABC registration.
         mrdi_doc = encode_mrdi(value)
         if mrdi_doc is not None:
             return {"type": "mrdi", "data": mrdi_doc}
@@ -551,7 +540,6 @@ class Julia:
         if kind == "rational":
             return QQ(ZZ(data["num"])) / QQ(ZZ(data["den"]))
         if kind == "vector":
-            # Containers are containers (docs/wire-format.md).
             return [self._decode_value(item, display) for item in data["data"]]
         if kind == "matrix":
             entries = [self._decode_value(item, display) for item in data["data"]]
