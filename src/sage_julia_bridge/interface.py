@@ -9,20 +9,24 @@ from __future__ import annotations
 
 import atexit
 import base64
+import fcntl
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import uuid
 from collections import deque
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from numbers import Integral, Rational
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from pydantic import BaseModel, ConfigDict
 from sage.matrix.constructor import matrix
@@ -92,8 +96,6 @@ class JuliaHandle:
         return f"JuliaHandle<{self._julia_type}>({self._display})"
 
     def _assert_current(self) -> None:
-        # Ids restart with each worker process; a stale id would silently
-        # resolve to a different object in the new worker's table.
         if self._generation != self._bridge._generation:
             raise JuliaStaleObjectError(f"stale handle from a previous Julia worker: {self!r}", kind="stale-object")
         if self._released:
@@ -222,9 +224,7 @@ class JuliaHandle:
         return self._bridge.call("parent", self)
 
     def __del__(self) -> None:
-        # Only enqueue: sending a request here could interleave with an
-        # in-flight request on the same pipe (GC runs at arbitrary points).
-        # Stale handles enqueue nothing: the value died with its worker.
+        """Queue current-generation releases without interrupting protocol traffic."""
         if not self._released and self._generation == self._bridge._generation:
             self._bridge._pending_releases.append(self._id)
 
@@ -237,6 +237,7 @@ class Julia:
         self._bridge = Path(__file__).with_name("julia_worker.jl")
         self._session_id = str(uuid.uuid4())
         self._proc: subprocess.Popen[str] | None = None
+        self._owner_lock: BinaryIO | None = None
         self._lock = threading.RLock()
         self._stderr: deque[str] = deque(maxlen=200)
         self._stderr_thread: threading.Thread | None = None
@@ -283,11 +284,10 @@ class Julia:
         return "".join(self._stderr).strip()
 
     def _ensure_process(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
-            return
-        # The bridge's own Julia deps (JSON) live in a repo-scoped project;
-        # Julia's default load-path stacking keeps shared-env packages such
-        # as Oscar loadable alongside it.
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                return
+            self._mark_worker_dead()
         julia_env = Path(__file__).with_name("julia_env")
         argv = self._command_argv() + [
             f"--project={julia_env}",
@@ -297,18 +297,27 @@ class Julia:
             str(self._bridge),
         ]
         self._stderr.clear()
-        # Handle ids die with the worker process they belong to.
         self._pending_releases.clear()
         self._generation += 1
-        self._proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-        )
+        owner_lock = tempfile.TemporaryFile()
+        try:
+            fcntl.lockf(owner_lock, fcntl.LOCK_EX)
+            supervisor = Path(__file__).with_name("_worker_supervisor.py")
+            self._proc = subprocess.Popen(
+                [sys.executable, "-I", str(supervisor), str(owner_lock.fileno()), *argv],
+                pass_fds=(owner_lock.fileno(),),
+                process_group=0,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+            )
+        except BaseException:
+            owner_lock.close()
+            raise
+        self._owner_lock = owner_lock
         self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._stderr_thread.start()
         self._negotiate_protocol()
@@ -390,17 +399,18 @@ class Julia:
 
     def _mark_worker_dead(self) -> None:
         proc = self._proc
-        self._proc = None
-        self._stderr_thread = None
-        self._pending_releases.clear()
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=2)
+        if self._owner_lock is not None:
+            self._owner_lock.close()
+            self._owner_lock = None
         if proc is not None:
+            proc.wait(timeout=2)
             for stream_name in ("stdin", "stdout", "stderr"):
                 stream = getattr(proc, stream_name)
                 if stream is not None:
                     self._close_worker_stream(stream)
+        self._proc = None
+        self._stderr_thread = None
+        self._pending_releases.clear()
 
     def _close_worker_stream(self, stream: Any) -> None:
         try:
@@ -429,9 +439,6 @@ class Julia:
             return {"type": "bool", "value": value}
         if isinstance(value, str):
             return {"type": "string", "value": value}
-        # Parent-carrying algebra travels as mrdi. This runs before the
-        # numeric branches so e.g. GF(p) elements can never be flattened
-        # to bare integers by a numbers-ABC registration.
         mrdi_doc = encode_mrdi(value)
         if mrdi_doc is not None:
             return {"type": "mrdi", "data": mrdi_doc}
@@ -533,7 +540,6 @@ class Julia:
         if kind == "rational":
             return QQ(ZZ(data["num"])) / QQ(ZZ(data["den"]))
         if kind == "vector":
-            # Containers are containers (docs/wire-format.md).
             return [self._decode_value(item, display) for item in data["data"]]
         if kind == "matrix":
             entries = [self._decode_value(item, display) for item in data["data"]]
@@ -621,27 +627,11 @@ class Julia:
                 return
             try:
                 if proc.poll() is None:
-                    try:
+                    with suppress(JuliaError, OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
                         self._request_unlocked("quit", "")
                         proc.wait(timeout=2)
-                    except Exception:
-                        proc = self._proc
-                        if proc is not None and proc.poll() is None:
-                            try:
-                                proc.terminate()
-                                proc.wait(timeout=2)
-                            except Exception:
-                                proc.kill()
-                                proc.wait(timeout=2)
             finally:
-                proc = self._proc
-                if proc is not None:
-                    for stream_name in ("stdin", "stdout", "stderr"):
-                        stream = getattr(proc, stream_name)
-                        if stream is not None:
-                            self._close_worker_stream(stream)
-                self._proc = None
-                self._stderr_thread = None
+                self._mark_worker_dead()
 
 
 julia = Julia()

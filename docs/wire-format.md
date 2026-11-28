@@ -14,11 +14,13 @@ Operations include `exec`, `value`, `resolve`, `set`, `call`, `call_object`, `ob
 A successful reply is `ok \t b64(display) \t b64(structured) \t b64(stdout) \t b64(stderr)`. An error reply is `err \t b64(json_error) \t b64(stdout) \t b64(stderr)`. The JSON error carries `kind`, Julia exception type, message, and backend stack.
 Protocol violations, conversion refusal, parent incompatibility, released objects, stale objects, backend dispatch, and worker death remain distinguishable.
 
+On POSIX, the Python client owns each worker through a process-associated record lock on a private temporary file. The separate supervisor holds an inherited descriptor, not the lock: POSIX record locks are released on owner-process exit and are not inherited by forked children. The supervisor tests for release before starting Julia and while waiting for its exit. Once released, it kills the entire backend process group and reaps its immediate child even during a request that cannot read protocol EOF. The supervisor and each backend group are separate from the client's group; ordinary launchers and their Julia descendants inherit the backend group, so cleanup cannot kill unrelated processes in the client's group. Launchers must not deliberately detach backend processes from that group. The supervisor observes launcher exit without reaping it, signals the owned group, and then reaps the launcher; its unreaped PID prevents reuse of the group identity before cleanup. The supervisor restores normal child reaping before launching its backend and does not retain the protocol pipes. Exit observation uses `waitid` without reaping on Unix and the process-exit event from `kqueue` on macOS (Python 3.12 does not expose `waitid` there). The worker project supplies JSON and uses Julia load-path stacking for shared-environment packages. Explicit `quit` still uses the protocol; forced cleanup releases the same ownership lock. The original process-associated lock also avoids tying worker lifetime to the transient Python thread that started it.
+
 ## Retained-object runtime
 
 A `handle` node identifies one worker-owned Julia value.
 Its Sage proxy records the bridge session and worker generation, so a restarted worker cannot alias an old ID. Repeated references in nested results reuse one backend ID. Each live proxy contributes one retained reference.
-`release()` is public and idempotent; garbage collection queues automatic release under the request lock.
+`release()` is public and idempotent; garbage collection queues current-generation releases rather than sending on the protocol pipe during an in-flight request. Stale handles never enqueue releases.
 
 Foreign objects support:
 
@@ -40,7 +42,7 @@ Text evaluation is a separate expert operation.
 
 ## Bridge nodes
 
-The `structured` slot and all `set`/`call` values are JSON trees of these nodes and no others:
+The `structured` slot and all `set`/`call` values are JSON trees of these nodes and no others. Parent-carrying algebra is encoded as MRDI before numeric ABC checks, so a finite-field element cannot lose its parent by being flattened to an integer:
 
 | node | fields | Julia value | Sage/Python value |
 | --- | --- | --- | --- |
